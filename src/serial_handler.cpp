@@ -11,6 +11,8 @@ SerialHandler::SerialHandler()
     , payload_pos_(0)
     , expected_checksum_(0)
     , frame_ready_(false)
+    , last_frame_time_(0)
+    , last_rx_byte_time_(0)
 {
     memset(&completed_frame_, 0, sizeof(completed_frame_));
 }
@@ -36,6 +38,7 @@ void SerialHandler::update() {
     if (!serial_) return;
 
     while (serial_->available()) {
+        last_rx_byte_time_ = millis();
         uint8_t byte = serial_->read();
 
         switch (state_) {
@@ -112,6 +115,7 @@ void SerialHandler::update() {
                         completed_frame_.seq = seq_;
                         completed_frame_.payload_length = frame_length_;
                         frame_ready_ = true;
+                        last_frame_time_ = millis();
                         log_d("Frame received: cmd=0x%02X seq=%u len=%u",
                               command_type_, seq_, frame_length_);
                     } else {

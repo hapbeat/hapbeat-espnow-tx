@@ -25,6 +25,12 @@ public:
     // Retrieve the latest parsed frame. Returns false if no frame is available.
     bool getFrame(SerialFrame& frame);
 
+    // Timestamp (millis) of last successfully received frame. 0 if none yet.
+    uint32_t getLastFrameTime() const { return last_frame_time_; }
+
+    // Timestamp (millis) of last byte received on serial RX. 0 if none yet.
+    uint32_t getLastRxByteTime() const { return last_rx_byte_time_; }
+
     // --- Response builders (Transmitter → Bridge) ---
 
     // Send ACK response for a given sequence number.
@@ -73,6 +79,12 @@ private:
     // Completed frame
     SerialFrame completed_frame_;
     bool frame_ready_;
+
+    // Timestamp of last valid frame
+    uint32_t last_frame_time_;
+
+    // Timestamp of last byte received (any byte, not just valid frames)
+    uint32_t last_rx_byte_time_;
 
     // Response sequence counter (responses use seq=0)
     static constexpr uint16_t RESPONSE_SEQ = 0;

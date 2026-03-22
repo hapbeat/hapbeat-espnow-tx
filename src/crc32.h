@@ -2,6 +2,7 @@
 #define CRC32_H
 
 #include <cstdint>
+#include <cstddef>
 
 // Compute CRC32 of a null-terminated string.
 // Uses standard CRC32 polynomial (0xEDB88320, reflected).

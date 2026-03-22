@@ -1,6 +1,7 @@
 #include "command_dispatcher.h"
 #include "config.h"
 #include "crc32.h"
+#include "display.h"
 #include <Arduino.h>
 #include <cstring>
 
@@ -140,6 +141,8 @@ void CommandDispatcher::handlePlay(const SerialFrame& frame) {
         }
     }
 
+    displaySendReaction("PLAY", event_id, target_group, ok);
+
     if (serial_) {
         serial_->sendAck(frame.seq, ok ? ACK_OK : ACK_ERROR);
     }
@@ -190,6 +193,8 @@ void CommandDispatcher::handleStop(const SerialFrame& frame) {
         }
     }
 
+    displaySendReaction("STOP", event_id, target_group, ok);
+
     if (serial_) {
         serial_->sendAck(frame.seq, ok ? ACK_OK : ACK_ERROR);
     }
@@ -225,6 +230,8 @@ void CommandDispatcher::handleStopAll(const SerialFrame& frame) {
             ok = sender_->sendToGroup(packet, target_group);
         }
     }
+
+    displaySendReaction("STOP ALL", nullptr, target_group, ok);
 
     if (serial_) {
         serial_->sendAck(frame.seq, ok ? ACK_OK : ACK_ERROR);
