@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Preferences.h>
 #include <cstring>
 
 EspNowSender* EspNowSender::instance_ = nullptr;
@@ -30,11 +31,21 @@ bool EspNowSender::init() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    // Set the WiFi channel
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    // Set the WiFi channel. NVS wins over the compile-time default so the
+    // channel set from Studio (set_espnow_channel) survives reboot
+    // (contracts/serial-config.md §4.9, DEC-034).
+    uint8_t channel = ESPNOW_CHANNEL;
+    {
+        Preferences p;
+        p.begin("espnow", true);
+        channel = p.getUChar("channel", ESPNOW_CHANNEL);
+        p.end();
+        if (channel != 1 && channel != 6 && channel != 11) channel = ESPNOW_CHANNEL;
+    }
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
     log_i("WiFi MAC: %s", WiFi.macAddress().c_str());
-    log_i("WiFi channel: %d", ESPNOW_CHANNEL);
+    log_i("WiFi channel: %d", channel);
 
     // Initialize ESP-NOW
     if (esp_now_init() != ESP_OK) {
@@ -48,7 +59,7 @@ bool EspNowSender::init() {
     // Register broadcast peer
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, BROADCAST_MAC, 6);
-    peer_info.channel = ESPNOW_CHANNEL;
+    peer_info.channel = channel;
     peer_info.encrypt = false;
 
     if (esp_now_add_peer(&peer_info) != ESP_OK) {

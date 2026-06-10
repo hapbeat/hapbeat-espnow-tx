@@ -7,6 +7,10 @@
 #include "command_dispatcher.h"
 #include "time_sync.h"
 #include "display.h"
+#include "node_serial_config.h"
+#ifdef AUDIO_SOURCE
+#include "audio_source.h"
+#endif
 
 // Global instances
 static SerialHandler      serialHandler;
@@ -28,6 +32,23 @@ void setup() {
     // Initialize display
     displayInit();
     displayBootStatus("Serial init...");
+
+#ifdef AUDIO_SOURCE
+    // ESP-NOW live audio source (DEC-034): line-in → ADPCM → broadcast.
+    // ESP-NOW init is shared with the relay path; the Bridge protocol is
+    // not used in this build (Studio JSON config only). Studio's Web Serial
+    // config speaks 921600 — the relay path gets this via serialHandler.init,
+    // so set it explicitly here.
+    Serial.begin(SERIAL_BAUD);
+    displayBootStatus("ESP-NOW init...");
+    if (!espNowSender.init()) {
+        displayError("ESP-NOW INIT FAILED");
+        while (true) delay(1000);
+    }
+    audioSourceSetup();
+    displayBootStatus("AUDIO SOURCE ready");
+    return;
+#endif
 
     // Initialize serial communication with the Bridge
     serialHandler.init(Serial);
@@ -55,6 +76,15 @@ void setup() {
 }
 
 void loop() {
+    // Studio JSON config (USB Web Serial) — consumes '{'-prefixed lines,
+    // leaves binary Bridge frames untouched (DEC-034 serial-config).
+    nodeSerialConfigUpdate();
+
+#ifdef AUDIO_SOURCE
+    audioSourceLoop();
+    return;
+#endif
+
     // Read and parse incoming serial data from the Bridge
     serialHandler.update();
 
