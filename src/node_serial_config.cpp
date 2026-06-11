@@ -35,7 +35,7 @@ static void handleLine(const char* line) {
         d["firmware"]  = FW_VERSION;
         d["role"]      = "transmitter";
         d["transport"] = "espnow_stream";
-        d["board"]     = "m5stack_core";
+        d["board"]     = "m5stack_basic";   // module name (not the MCU)
         Preferences p;
         p.begin("espnow", true);
         d["espnow_channel"] = p.getUChar("channel", 1);

@@ -12,19 +12,20 @@ Import("env")  # noqa: F821  (PlatformIO construction environment)
 
 VARIANTS = {
     # Bridge command relay: PC (Bridge) -> USB serial -> ESP-NOW commands.
+    # board names the module (M5Stack Basic, classic ESP32), not the MCU.
     "esp32": {
         "role": "transmitter",
         "transport": "espnow_stream",
-        "board": "m5stack_core",
-        "label": "Bridge 中継機 (ESP-NOW)",
+        "board": "m5stack_basic",
+        "label": "Bridge 中継機 (M5Stack Basic)",
         "description": "Bridge からのコマンドを ESP-NOW で Hapbeat 群に同報する中継機。",
     },
     # Live audio source: PA line-in -> ADPCM -> ESP-NOW 0xAA stream.
     "m5stack_audio_tx": {
         "role": "transmitter",
         "transport": "espnow_stream",
-        "board": "m5stack_core",
-        "label": "ESP-NOW ライブ送信機 (PA 入力)",
+        "board": "m5stack_basic",
+        "label": "ESP-NOW ライブ送信機 (M5Stack Basic)",
         "description": "PA ライン入力を ESP-NOW で同報するライブ音声送信機。",
     },
 }
