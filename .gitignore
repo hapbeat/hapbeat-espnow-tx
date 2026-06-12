@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Internal dev notes (use workspace dev-notes/<repo-name>/ instead)
+dev-notes/
+dist/

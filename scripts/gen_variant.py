@@ -10,6 +10,10 @@ import os
 
 Import("env")  # noqa: F821  (PlatformIO construction environment)
 
+# Label format: "<device> (<purpose>)" — matches the receiver-side format
+# used by hapbeat-device-firmware/merge_firmware.py so the Studio firmware
+# library reads as "device name first" across all node types (was
+# previously "<purpose> (<device>)" — inverted relative to receivers).
 VARIANTS = {
     # Bridge command relay: PC (Bridge) -> USB serial -> ESP-NOW commands.
     # board names the module (M5Stack Basic, classic ESP32), not the MCU.
@@ -17,7 +21,7 @@ VARIANTS = {
         "role": "transmitter",
         "transport": "espnow_stream",
         "board": "m5stack_basic",
-        "label": "Bridge 中継機 (M5Stack Basic)",
+        "label": "M5Stack Basic (Bridge 中継機)",
         "description": "Bridge からのコマンドを ESP-NOW で Hapbeat 群に同報する中継機。",
     },
     # Live audio source: PA line-in -> ADPCM -> ESP-NOW 0xAA stream.
@@ -25,7 +29,7 @@ VARIANTS = {
         "role": "transmitter",
         "transport": "espnow_stream",
         "board": "m5stack_basic",
-        "label": "ESP-NOW ライブ送信機 (M5Stack Basic)",
+        "label": "M5Stack Basic (ライブ送信機)",
         "description": "PA ライン入力を ESP-NOW で同報するライブ音声送信機。",
     },
 }
@@ -41,6 +45,20 @@ def write_variant(source, target, env):  # noqa: ARG001
     with open(out, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[variant] Wrote variant.json: role={meta['role']} label={meta['label']}")
+
+    # Stable dist/ copy — `.pio/build` is volatile (cleans / parallel
+    # sessions prune other envs), which made the Studio dev firmware
+    # library fall back to its snapshot cache. dist/<env>/ (gitignored)
+    # survives and is what the Studio dev plugin reads first. Mirrors
+    # hapbeat-device-firmware/merge_firmware.py.
+    import shutil
+    dist_dir = os.path.join(env.subst("$PROJECT_DIR"), "dist", pioenv)
+    os.makedirs(dist_dir, exist_ok=True)
+    for name in ("firmware.bin", "variant.json"):
+        src = os.path.join(build_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dist_dir, name))
+    print(f"[variant] Copied distributables to dist/{pioenv}/")
 
 
 env.AddPostAction("$BUILD_DIR/firmware.bin", write_variant)  # noqa: F821
