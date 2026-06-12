@@ -3,7 +3,11 @@
 
 #include <cstdint>
 
-// Serial communication
+// Serial communication. M5Stack Basic/Core uses the CP2104 (CP210x) bridge,
+// which is reliable at 921600 (its standard flash baud) — unlike the FTDI
+// FT232R on M5 ATOM Lite, which needs 115200. So this M5Stack firmware keeps
+// 921600; Studio opens the config link at a matching baud per the port's USB
+// bridge VID (CP210x → 921600, FTDI/CH340 → 115200).
 static constexpr uint32_t SERIAL_BAUD = 921600;
 static constexpr uint16_t MAX_SERIAL_BUFFER = 512;
 
