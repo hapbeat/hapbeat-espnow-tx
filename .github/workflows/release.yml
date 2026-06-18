@@ -1,0 +1,160 @@
+name: Firmware Build & Release
+
+# Hapbeat ESP-NOW transmitter firmware — a 周辺機器 (peripheral) node, published
+# to its own GitHub Release and aggregated into Hapbeat Studio's firmware
+# library alongside hapbeat-device-firmware (see hapbeat-studio
+# scripts/aggregate-firmware-manifest.mjs — REPO_SHORT maps this repo to "tx").
+#
+# Triggers mirror hapbeat-device-firmware:
+#   - push to master:      build all envs, upload artifacts (10-day retention).
+#   - push of v* tag:      same build + publish a GitHub Release + redeploy Studio.
+#   - workflow_dispatch:   manual re-release (specify tag_name to update a release).
+#
+# ⚠️ UNVERIFIED ON HARDWARE (created 2026-06-18 from a hapbeat-studio session):
+#    The in-CI merge below mirrors hapbeat-device-firmware/merge_firmware.py's
+#    classic-ESP32 path (bootloader@0x1000 + partitions@0x8000 + app@0x10000),
+#    which device-firmware already ships for its classic-ESP32 env
+#    (atom_lite_sensor). It has NOT yet been built+flashed for THIS repo.
+#    Before pushing the FIRST real tag: run this workflow on master (or do a
+#    local `pio run`), then flash an M5Stack via Studio prod USB-Serial download
+#    mode and confirm the merged firmware_full_serial.bin boots. Details:
+#    instructions/applied/applied-release-workflow-202606180000.md
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+# Opt into Node.js 24 (Node 20 actions deprecated 2026-06-02).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env:
+          - esp32             # Bridge command relay (M5Stack Basic)
+          - m5stack_audio_tx  # ESP-NOW live audio source (M5Stack Basic)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch → checkout tag_name; tag push → github.ref;
+          # master push → github.ref (master). Same as device-firmware.
+          ref: ${{ github.event.inputs.tag_name || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO + esptool
+        # Pin esptool to the v4 CLI (v5 renames merge_bin → merge-bin and drops
+        # some flags); matches the flag syntax device-firmware uses.
+        run: pip install platformio "esptool>=4.5,<5"
+
+      - name: Build ${{ matrix.env }}
+        run: pio run -e ${{ matrix.env }}
+
+      # Transmitter nodes are serial-only (never join Wi-Fi), so there is NO
+      # firmware_app_ota.bin — only a merged firmware_full_serial.bin for USB
+      # Serial download-mode flashing via Studio. Classic ESP32 (M5Stack) boots
+      # its bootloader from 0x1000; merge_bin pads the first 4 KB with 0xFF so
+      # the merged image still starts at 0x0 and Studio's fixed split-flash
+      # layout ([0x0,0x9000) + otadata erase + app@0x10000) applies unchanged.
+      # Mirrors hapbeat-device-firmware/merge_firmware.py.
+      - name: Collect + merge artifacts
+        run: |
+          mkdir -p release-artifacts
+          b=".pio/build/${{ matrix.env }}"
+          python -m esptool --chip esp32 merge_bin \
+            -o "release-artifacts/${{ matrix.env }}_firmware_full_serial.bin" \
+            --flash_size 4MB --flash_mode dio \
+            0x1000  "$b/bootloader.bin" \
+            0x8000  "$b/partitions.bin" \
+            0x10000 "$b/firmware.bin"
+          # variant.json (role/transport/board/label) from scripts/gen_variant.py
+          # — consumed by generate-manifest.mjs so the release manifest carries
+          # node-role metadata (DEC-034). Studio files it under 周辺機器.
+          if [ -f "$b/variant.json" ]; then
+            cp "$b/variant.json" "release-artifacts/${{ matrix.env }}_variant.json"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-${{ matrix.env }}
+          path: release-artifacts/
+          retention-days: 10
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          merge-multiple: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate manifest.json
+        run: node .github/scripts/generate-manifest.mjs all-artifacts ${{ steps.tag.outputs.name }}
+
+      - name: List release files
+        run: ls -lh all-artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Transmitter Firmware ${{ steps.tag.outputs.name }}
+          body: |
+            Hapbeat ESP-NOW transmitter firmware ${{ github.ref_name }} (周辺機器).
+
+            ## Artifacts
+
+            | File | Description |
+            |------|-------------|
+            | `*_firmware_full_serial.bin` | Merged image for **USB Serial** flashing (transmitter is serial-only — no Wi-Fi OTA) |
+            | `manifest.json` | Machine-readable index consumed by Hapbeat Studio |
+
+            Flash via [Hapbeat Studio](https://devtools.hapbeat.com/studio/) — no PlatformIO required.
+          files: |
+            all-artifacts/*.bin
+            all-artifacts/manifest.json
+
+      - name: Trigger Studio redeploy
+        run: |
+          echo '{"event_type":"firmware-released","client_payload":{"fw_tag":"${{ steps.tag.outputs.name }}"}}' \
+            | gh api repos/Hapbeat/hapbeat-studio/dispatches --method POST --input -
+        env:
+          GH_TOKEN: ${{ secrets.STUDIO_DISPATCH_TOKEN }}
