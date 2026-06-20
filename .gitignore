@@ -7,3 +7,6 @@
 # Internal dev notes (use workspace dev-notes/<repo-name>/ instead)
 dev-notes/
 dist/
+CLAUDE.md
+instructions/
+.claude/
