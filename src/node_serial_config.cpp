@@ -10,13 +10,44 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
+#ifdef AUDIO_SOURCE
+#include "audio_source.h"
+#endif
+#ifdef REPEATER
+#include "repeater.h"
+#endif
+
 static const char* FW_VERSION = "0.1.0";
+
+// Determine build mode string at compile time.
+#if defined(AUDIO_SOURCE)
+  static const char* BUILD_MODE = "source";
+#elif defined(REPEATER)
+  static const char* BUILD_MODE = "repeater";
+#else
+  static const char* BUILD_MODE = "relay";
+#endif
 
 static void sendResp(JsonDocument& r) {
     String out;
     serializeJson(r, out);
     Serial.print(out);
     Serial.print('\n');
+}
+
+// Parse "AA:BB:CC:DD:EE:FF" (case-insensitive) → 6 bytes.
+// Returns true on success.
+static bool parseMacStr(const char* str, uint8_t* mac) {
+    unsigned int b[6];
+    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+    return true;
+}
+
+static void macToStr(const uint8_t* mac, char* buf, size_t n) {
+    snprintf(buf, n, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 static void handleLine(const char* line) {
@@ -26,6 +57,7 @@ static void handleLine(const char* line) {
 
     JsonDocument r;
 
+    // ---- get_info ----------------------------------------------------------
     if (strcmp(cmd, "get_info") == 0) {
         r["status"] = "ok";
         r["cmd"]    = "get_info";
@@ -35,31 +67,51 @@ static void handleLine(const char* line) {
         d["firmware"]  = FW_VERSION;
         d["role"]      = "transmitter";
         d["transport"] = "espnow_stream";
-        d["board"]     = "m5stack_basic";   // module name (not the MCU)
+        d["board"]     = "m5stack_basic";
+        d["mode"]      = BUILD_MODE;   // "source" | "repeater" | "relay"
+
         Preferences p;
         p.begin("espnow", true);
         d["espnow_channel"] = p.getUChar("channel", 1);
+
+        // relay_src: report as MAC string if set
+        uint8_t relay_mac[6] = {};
+        size_t mac_len = p.getBytesLength("relay_src");
+        if (mac_len == 6) {
+            p.getBytes("relay_src", relay_mac, 6);
+            char mac_str[18];
+            macToStr(relay_mac, mac_str, sizeof(mac_str));
+            d["relay_src"] = mac_str;
+        } else {
+            d["relay_src"] = nullptr;
+        }
         p.end();
+
         p.begin("tx", true);
         d["input_level"] = p.getInt("input_level", 50);
         p.end();
+
         sendResp(r);
         return;
     }
 
+    // ---- set_espnow_channel ------------------------------------------------
     if (strcmp(cmd, "set_espnow_channel") == 0) {
         int ch = doc["channel"] | 1;
         if (ch != 1 && ch != 6 && ch != 11) {
-            r["status"] = "error"; r["cmd"] = cmd; r["message"] = "channel must be 1/6/11";
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "channel must be 1/6/11";
             sendResp(r); return;
         }
-        Preferences p; p.begin("espnow", false); p.putUChar("channel", (uint8_t)ch); p.end();
-        esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);   // live apply
+        Preferences p; p.begin("espnow", false);
+        p.putUChar("channel", (uint8_t)ch); p.end();
+        esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);  // live apply
         r["status"] = "ok"; r["cmd"] = cmd; r["channel"] = ch;
         sendResp(r);
         return;
     }
 
+    // ---- set_input_level ---------------------------------------------------
     if (strcmp(cmd, "set_input_level") == 0) {
         int lv = doc["level"] | 50;
         if (lv < 0) lv = 0; if (lv > 100) lv = 100;
@@ -69,6 +121,35 @@ static void handleLine(const char* line) {
         return;
     }
 
+    // ---- set_relay_source --------------------------------------------------
+    // Sets the source MAC to relay (for REPEATER builds; stored for all modes
+    // so it survives a reflash to REPEATER firmware without reconfiguration).
+    // {"cmd":"set_relay_source","mac":"AA:BB:CC:DD:EE:FF"}
+    if (strcmp(cmd, "set_relay_source") == 0) {
+        const char* mac_str = doc["mac"] | "";
+        uint8_t mac[6] = {};
+        if (!parseMacStr(mac_str, mac)) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "mac must be 'AA:BB:CC:DD:EE:FF'";
+            sendResp(r); return;
+        }
+        // Persist to NVS
+        Preferences p; p.begin("espnow", false);
+        p.putBytes("relay_src", mac, 6); p.end();
+        // Live apply in REPEATER build
+#ifdef REPEATER
+        repeaterSetRelaySrc(mac);
+#endif
+        char out_str[18];
+        macToStr(mac, out_str, sizeof(out_str));
+        r["status"]    = "ok";
+        r["cmd"]       = cmd;
+        r["relay_src"] = out_str;
+        sendResp(r);
+        return;
+    }
+
+    // ---- reboot ------------------------------------------------------------
     if (strcmp(cmd, "reboot") == 0) {
         r["status"] = "ok"; r["cmd"] = "reboot";
         sendResp(r);

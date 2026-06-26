@@ -11,14 +11,17 @@
 #ifdef AUDIO_SOURCE
 #include "audio_source.h"
 #endif
+#ifdef REPEATER
+#include "repeater.h"
+#endif
 
-// Global instances
+// Global instances (Bridge relay path only)
 static SerialHandler      serialHandler;
 static EspNowSender       espNowSender;
 static TimeSync           timeSync;
 static CommandDispatcher   dispatcher;
 
-// Periodic status report timing
+// Periodic status report timing (Bridge relay path only)
 static uint32_t lastStatusReport = 0;
 static constexpr uint32_t DISPLAY_UPDATE_MS = 500;
 
@@ -29,16 +32,14 @@ void setup() {
     // Initialize M5Stack (LCD, SD, Serial, I2C)
     M5.begin(true, false, true, false);  // LCD=true, SD=false, Serial=true, I2C=false
 
-    // Initialize display
     displayInit();
     displayBootStatus("Serial init...");
 
 #ifdef AUDIO_SOURCE
     // ESP-NOW live audio source (DEC-034): line-in → ADPCM → broadcast.
-    // ESP-NOW init is shared with the relay path; the Bridge protocol is
-    // not used in this build (Studio JSON config only). Studio's Web Serial
-    // config speaks 921600 — the relay path gets this via serialHandler.init,
-    // so set it explicitly here.
+    // EspNowSender.init() provides WiFi STA + channel (from NVS) + esp_now_init
+    // + broadcast peer registration. audioSourceSetup() then overrides the send
+    // callback and initialises I2S.
     Serial.begin(SERIAL_BAUD);
     displayBootStatus("ESP-NOW init...");
     if (!espNowSender.init()) {
@@ -50,13 +51,27 @@ void setup() {
     return;
 #endif
 
-    // Initialize serial communication with the Bridge
+#ifdef REPEATER
+    // ESP-NOW repeater (DEC-033): receives 0xAA from source MAC, re-broadcasts.
+    // Same init path as AUDIO_SOURCE: EspNowSender provides the ESP-NOW base,
+    // repeaterSetup() registers the receive callback.
+    Serial.begin(SERIAL_BAUD);
+    displayBootStatus("ESP-NOW init...");
+    if (!espNowSender.init()) {
+        displayError("ESP-NOW INIT FAILED");
+        while (true) delay(1000);
+    }
+    repeaterSetup();
+    displayBootStatus("REPEATER ready");
+    return;
+#endif
+
+    // ---- Bridge command relay path ----------------------------------------
     serialHandler.init(Serial);
 
     log_i("=== Hapbeat Transmitter Firmware ===");
     log_i("Initializing...");
 
-    // Initialize ESP-NOW sender (sets up WiFi STA mode and ESP-NOW)
     displayBootStatus("ESP-NOW init...");
     if (!espNowSender.init()) {
         log_e("ESP-NOW initialization failed! Halting.");
@@ -67,7 +82,6 @@ void setup() {
     }
     displayBootStatus("ESP-NOW OK");
 
-    // Initialize command dispatcher with references to all subsystems
     dispatcher.init(serialHandler, espNowSender, timeSync);
 
     displayBootStatus("Ready. Waiting for Bridge.");
@@ -85,34 +99,34 @@ void loop() {
     return;
 #endif
 
-    // Read and parse incoming serial data from the Bridge
+#ifdef REPEATER
+    repeaterLoop();
+    return;
+#endif
+
+    // ---- Bridge relay path ------------------------------------------------
     serialHandler.update();
 
-    // Process any completely received frames
     SerialFrame frame;
     if (serialHandler.getFrame(frame)) {
         dispatcher.processFrame(frame);
     }
 
-    // Periodic status + display update
     uint32_t now = millis();
     if (now - lastStatusReport >= DISPLAY_UPDATE_MS) {
         lastStatusReport = now;
         uint32_t uptime_sec = now / 1000;
 
-        // Update header connection status (any byte received = port is open)
         uint32_t lastRx = serialHandler.getLastRxByteTime();
         bool connected = (lastRx > 0) && (now - lastRx < SERIAL_CONNECT_TIMEOUT_MS);
         displayUpdateHeader(connected);
 
-        // Update LCD status
         displayUpdateStatus(uptime_sec,
                             espNowSender.getTotalSent(),
                             espNowSender.getTotalFailed(),
                             ESPNOW_CHANNEL,
                             timeSync.isSynced());
 
-        // Serial log at lower frequency (every STATUS_REPORT_INTERVAL_MS)
         static uint32_t lastSerialLog = 0;
         if (now - lastSerialLog >= STATUS_REPORT_INTERVAL_MS) {
             lastSerialLog = now;

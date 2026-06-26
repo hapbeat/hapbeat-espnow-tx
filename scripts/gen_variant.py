@@ -24,13 +24,23 @@ VARIANTS = {
         "label": "M5Stack Basic (Bridge 中継機)",
         "description": "Bridge からのコマンドを ESP-NOW で Hapbeat 群に同報する中継機。",
     },
-    # Live audio source: PA line-in -> ADPCM -> ESP-NOW 0xAA stream.
+    # Live audio source: PA line-in -> ADPCM -> ESP-NOW 0xAA stream (DEC-034/DEC-033).
+    # Includes piggyback (§3.2) and in-flight control for robust low-latency streaming.
     "m5stack_audio_tx": {
         "role": "transmitter",
         "transport": "espnow_stream",
         "board": "m5stack_basic",
         "label": "M5Stack Basic (ライブ送信機)",
         "description": "PA ライン入力を ESP-NOW で同報するライブ音声送信機。",
+    },
+    # Repeater: re-broadcasts 0xAA packets from a configured source MAC (DEC-033).
+    # 1-hop relay; loop-prevention via single-source-MAC allowlist.
+    "m5stack_repeater": {
+        "role": "transmitter",
+        "transport": "espnow_stream",
+        "board": "m5stack_basic",
+        "label": "M5Stack Basic (リピータ)",
+        "description": "音声ソース機からの ESP-NOW ストリームを中継して受信機のカバレッジを拡張する。",
     },
 }
 

@@ -203,6 +203,114 @@ void displaySendReaction(const char* cmd, const char* event_id,
     s_reaction_visible = true;
 }
 
+// ---------------------------------------------------------------------------
+// Audio source stats display (AUDIO_SOURCE mode)
+// ---------------------------------------------------------------------------
+
+// Previous values for dirty-check
+static uint8_t  s_as_ch       = 0xFF;
+static int      s_as_level    = -1;
+static uint32_t s_as_pkt      = UINT32_MAX;
+static int      s_as_inflight = -1;
+static uint32_t s_as_drop     = UINT32_MAX;
+static uint32_t s_as_fail     = UINT32_MAX;
+static bool     s_as_first    = true;
+
+void displayUpdateAudioStats(uint8_t ch, int level, uint32_t pkt,
+                              int inflight, uint32_t drop, uint32_t fail) {
+    if (s_as_first) {
+        // Clear status area and draw mode header
+        M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x000F);  // dark blue-purple
+        M5.Lcd.setTextDatum(MC_DATUM);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(COL_TEXT, 0x000F);
+        M5.Lcd.drawString("HAPBEAT TX [SOURCE]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+        M5.Lcd.setTextDatum(TL_DATUM);
+        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
+        s_as_first = false;
+    }
+
+    M5.Lcd.setTextSize(2);
+
+    // Line 1: channel + input level
+    if (ch != s_as_ch || level != s_as_level) {
+        s_as_ch = ch; s_as_level = level;
+        char tmp[24];
+        snprintf(tmp, sizeof(tmp), "CH:%-2u  LVL:%-3d%%", ch, level * 2);
+        drawField(4, STATUS_Y, COL_TEXT, tmp, 18);
+    }
+
+    // Line 2: packet count + in-flight
+    if (pkt != s_as_pkt || inflight != s_as_inflight) {
+        s_as_pkt = pkt; s_as_inflight = inflight;
+        char tmp[24];
+        snprintf(tmp, sizeof(tmp), "PKT:%-8u Q:%d", pkt, inflight);
+        drawField(4, STATUS_Y + 24, COL_OK, tmp, 20);
+    }
+
+    // Line 3: drop + fail
+    if (drop != s_as_drop || fail != s_as_fail) {
+        s_as_drop = drop; s_as_fail = fail;
+        char tmp[28];
+        uint16_t col = (drop > 0 || fail > 0) ? COL_WARN : COL_DIM;
+        snprintf(tmp, sizeof(tmp), "DROP:%-6u FAIL:%-5u", drop, fail);
+        drawField(4, STATUS_Y + 48, col, tmp, 22);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Repeater stats display (REPEATER mode)
+// ---------------------------------------------------------------------------
+
+static uint8_t  s_rp_ch      = 0xFF;
+static uint32_t s_rp_relayed = UINT32_MAX;
+static uint32_t s_rp_dropped = UINT32_MAX;
+static char     s_rp_mac[18] = "";
+static bool     s_rp_first   = true;
+
+void displayUpdateRepeaterStats(uint8_t ch, const char* relay_mac,
+                                 uint32_t relayed, uint32_t dropped) {
+    if (s_rp_first) {
+        M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x4000);  // dark red
+        M5.Lcd.setTextDatum(MC_DATUM);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(COL_TEXT, 0x4000);
+        M5.Lcd.drawString("HAPBEAT TX [RELAY]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+        M5.Lcd.setTextDatum(TL_DATUM);
+        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
+        s_rp_first = false;
+    }
+
+    M5.Lcd.setTextSize(2);
+
+    // Line 1: channel
+    if (ch != s_rp_ch) {
+        s_rp_ch = ch;
+        char tmp[12];
+        snprintf(tmp, sizeof(tmp), "CH: %-2u", ch);
+        drawField(4, STATUS_Y, COL_TEXT, tmp, 8);
+    }
+
+    // Line 2: source MAC
+    if (relay_mac && strcmp(relay_mac, s_rp_mac) != 0) {
+        strncpy(s_rp_mac, relay_mac, sizeof(s_rp_mac) - 1);
+        s_rp_mac[sizeof(s_rp_mac) - 1] = '\0';
+        M5.Lcd.setTextSize(1);  // small text for MAC
+        drawField(4, STATUS_Y + 26, COL_DIM, "SRC:", 4);
+        M5.Lcd.setTextSize(2);
+        drawField(40, STATUS_Y + 24, COL_TEXT, relay_mac, 17);
+    }
+
+    // Line 3: relayed + dropped
+    if (relayed != s_rp_relayed || dropped != s_rp_dropped) {
+        s_rp_relayed = relayed; s_rp_dropped = dropped;
+        char tmp[28];
+        uint16_t col = (dropped > 0) ? COL_WARN : COL_OK;
+        snprintf(tmp, sizeof(tmp), "OK:%-8u DROP:%-5u", relayed, dropped);
+        drawField(4, STATUS_Y + 48, col, tmp, 22);
+    }
+}
+
 void displayError(const char* msg) {
     M5.Lcd.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, TFT_MAROON);
     M5.Lcd.setTextSize(2);

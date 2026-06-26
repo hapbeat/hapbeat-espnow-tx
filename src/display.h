@@ -28,4 +28,16 @@ void displaySendReaction(const char* cmd, const char* event_id,
 // Show an error message briefly
 void displayError(const char* msg);
 
+// Audio source mode stats display (~4 fps).
+// ch: ESP-NOW channel, level: input_level 0-100, pkt: total sent,
+// inflight: current in-flight count, drop: dropped (busy), fail: send errors.
+void displayUpdateAudioStats(uint8_t ch, int level, uint32_t pkt,
+                              int inflight, uint32_t drop, uint32_t fail);
+
+// Repeater mode stats display (~4 fps).
+// ch: ESP-NOW channel, relay_mac: source MAC string ("AA:BB:CC:DD:EE:FF" or "not set"),
+// relayed: packets relayed, dropped: packets ignored (wrong src or pending slot full).
+void displayUpdateRepeaterStats(uint8_t ch, const char* relay_mac,
+                                 uint32_t relayed, uint32_t dropped);
+
 #endif // DISPLAY_H
