@@ -1,156 +1,167 @@
 name: Firmware Build & Release
 
-# Hapbeat ESP-NOW transmitter firmware — a 周辺機器 (peripheral) node, published
-# to its own GitHub Release and aggregated into Hapbeat Studio's firmware
-# library alongside hapbeat-device-firmware (see hapbeat-studio
-# scripts/aggregate-firmware-manifest.mjs — REPO_SHORT maps this repo to "tx").
+# Hapbeat ESP-NOW transmitter firmware — a 周辺機器 (peripheral) node. Per-env
+# independent versioning (DEC-035): tags are namespaced tx/<env>/vX.Y.Z and a
+# release attaches ONLY the tagged env. Aggregated into Studio's firmware
+# library (aggregate-firmware-manifest.mjs maps this repo to "tx").
 #
-# Triggers mirror hapbeat-device-firmware:
-#   - push to master:      build all envs, upload artifacts (10-day retention).
-#   - push of v* tag:      same build + publish a GitHub Release + redeploy Studio.
-#   - workflow_dispatch:   manual re-release (specify tag_name to update a release).
+#   - push to master:               smoke-build the curated env matrix (no release).
+#   - push of tx/<env>/v*:          build & release ONLY that one env.
+#   - workflow_dispatch(tag_name):  re-release a single env (overwrite allowed).
 #
-# ⚠️ UNVERIFIED ON HARDWARE (created 2026-06-18 from a hapbeat-studio session):
-#    The in-CI merge below mirrors hapbeat-device-firmware/merge_firmware.py's
-#    classic-ESP32 path (bootloader@0x1000 + partitions@0x8000 + app@0x10000),
-#    which device-firmware already ships for its classic-ESP32 env
-#    (atom_lite_sensor). It has NOT yet been built+flashed for THIS repo.
-#    Before pushing the FIRST real tag: run this workflow on master (or do a
-#    local `pio run`), then flash an M5Stack via Studio prod USB-Serial download
-#    mode and confirm the merged firmware_full_serial.bin boots. Details:
-#    instructions/applied/applied-release-workflow-202606180000.md
+# ⚠️ UNVERIFIED ON HARDWARE (2026-06-18): the in-CI esptool merge mirrors
+#    hapbeat-device-firmware's classic-ESP32 path. Before pushing the FIRST real
+#    tag, build on master (or local `pio run`) and flash an M5Stack via Studio
+#    USB-Serial to confirm the merged firmware_full_serial.bin boots.
 on:
   push:
     branches: [master]
-    tags: ['v*']
+    tags: ['*/v*']
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag to release (e.g. v0.1.0)'
+        description: 'Namespaced tag to release (e.g. tx/m5stack_audio_tx/v0.1.0)'
         required: true
 
-# Opt into Node.js 24 (Node 20 actions deprecated 2026-06-02).
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.env }}
+  # --------------------------------------------------------------------------
+  # Smoke build — master push only.
+  # --------------------------------------------------------------------------
+  smoke:
+    name: Smoke build ${{ matrix.env }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         env:
           - esp32             # Bridge command relay (M5Stack Basic)
           - m5stack_audio_tx  # ESP-NOW live audio source (M5Stack Basic)
     steps:
       - uses: actions/checkout@v4
-        with:
-          # workflow_dispatch → checkout tag_name; tag push → github.ref;
-          # master push → github.ref (master). Same as device-firmware.
-          ref: ${{ github.event.inputs.tag_name || github.ref }}
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
           path: ~/.platformio
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
-
       - name: Install PlatformIO + esptool
-        # Pin esptool to the v4 CLI (v5 renames merge_bin → merge-bin and drops
-        # some flags); matches the flag syntax device-firmware uses.
         run: pip install platformio "esptool>=4.5,<5"
-
       - name: Build ${{ matrix.env }}
         run: pio run -e ${{ matrix.env }}
 
-      # Transmitter nodes are serial-only (never join Wi-Fi), so there is NO
-      # firmware_app_ota.bin — only a merged firmware_full_serial.bin for USB
-      # Serial download-mode flashing via Studio. Classic ESP32 (M5Stack) boots
-      # its bootloader from 0x1000; merge_bin pads the first 4 KB with 0xFF so
-      # the merged image still starts at 0x0 and Studio's fixed split-flash
-      # layout ([0x0,0x9000) + otadata erase + app@0x10000) applies unchanged.
-      # Mirrors hapbeat-device-firmware/merge_firmware.py.
-      - name: Collect + merge artifacts
-        run: |
-          mkdir -p release-artifacts
-          b=".pio/build/${{ matrix.env }}"
-          python -m esptool --chip esp32 merge_bin \
-            -o "release-artifacts/${{ matrix.env }}_firmware_full_serial.bin" \
-            --flash_size 4MB --flash_mode dio \
-            0x1000  "$b/bootloader.bin" \
-            0x8000  "$b/partitions.bin" \
-            0x10000 "$b/firmware.bin"
-          # variant.json (role/transport/board/label) from scripts/gen_variant.py
-          # — consumed by generate-manifest.mjs so the release manifest carries
-          # node-role metadata (DEC-034). Studio files it under 周辺機器.
-          if [ -f "$b/variant.json" ]; then
-            cp "$b/variant.json" "release-artifacts/${{ matrix.env }}_variant.json"
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fw-${{ matrix.env }}
-          path: release-artifacts/
-          retention-days: 10
-          if-no-files-found: error
-
+  # --------------------------------------------------------------------------
+  # Release — single env, on a namespaced tag push or manual dispatch.
+  # --------------------------------------------------------------------------
   release:
-    name: Publish GitHub Release
-    needs: build
+    name: Release single env
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Resolve & validate tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          if [[ ! "$TAG" =~ ^[a-z]+/[A-Za-z0-9_]+/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' must be <repoShort>/<env>/vX.Y.Z (e.g. tx/m5stack_audio_tx/v0.1.0)"
+            exit 1
+          fi
+          ENVN="${TAG#*/}"; ENVN="${ENVN%/v*}"
+          {
+            echo "name=$TAG"
+            echo "env=$ENVN"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release env='$ENVN' tag='$TAG'"
 
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - name: Overwrite guard (tag push only)
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          if gh release view "${{ steps.tag.outputs.name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::release '${{ steps.tag.outputs.name }}' already exists. Re-release via workflow_dispatch."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/checkout@v4
         with:
-          path: all-artifacts
-          merge-multiple: true
+          ref: ${{ steps.tag.outputs.name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO + esptool
+        run: pip install platformio "esptool>=4.5,<5"
+
+      - name: Build ${{ steps.tag.outputs.env }}
+        run: pio run -e ${{ steps.tag.outputs.env }}
+
+      # Serial-only: produce the merged firmware_full_serial.bin (no app_ota).
+      # CoreS3 is ESP32-S3 (bootloader@0x0); the others are classic ESP32
+      # (bootloader@0x1000, padded so the merged image still starts at 0x0).
+      - name: Collect + merge artifacts (single env)
+        run: |
+          mkdir -p release-artifacts
+          E="${{ steps.tag.outputs.env }}"
+          b=".pio/build/$E"
+          if [[ "$E" == *cores3* ]]; then
+            CHIP=esp32s3; BOOT_OFF=0x0
+          else
+            CHIP=esp32;   BOOT_OFF=0x1000
+          fi
+          python -m esptool --chip "$CHIP" merge_bin \
+            -o "release-artifacts/${E}_firmware_full_serial.bin" \
+            --flash_size 4MB --flash_mode dio \
+            "$BOOT_OFF" "$b/bootloader.bin" \
+            0x8000      "$b/partitions.bin" \
+            0x10000     "$b/firmware.bin"
+          if [ -f "$b/variant.json" ]; then
+            cp "$b/variant.json" "release-artifacts/${E}_variant.json"
+          fi
 
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Resolve tag name
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "name=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Generate manifest.json
-        run: node .github/scripts/generate-manifest.mjs all-artifacts ${{ steps.tag.outputs.name }}
+        run: node .github/scripts/generate-manifest.mjs release-artifacts "${{ steps.tag.outputs.name }}"
 
       - name: List release files
-        run: ls -lh all-artifacts/
+        run: ls -lh release-artifacts/
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: Transmitter Firmware ${{ steps.tag.outputs.name }}
           body: |
-            Hapbeat ESP-NOW transmitter firmware ${{ github.ref_name }} (周辺機器).
+            Hapbeat ESP-NOW transmitter firmware — env `${{ steps.tag.outputs.env }}` (${{ steps.tag.outputs.name }}, 周辺機器).
 
             ## Artifacts
 
             | File | Description |
             |------|-------------|
-            | `*_firmware_full_serial.bin` | Merged image for **USB Serial** flashing (transmitter is serial-only — no Wi-Fi OTA) |
-            | `manifest.json` | Machine-readable index consumed by Hapbeat Studio |
+            | `*_firmware_full_serial.bin` | Merged image for **USB Serial** flashing (serial-only — no Wi-Fi OTA) |
+            | `manifest.json` | Machine-readable fragment consumed by Hapbeat Studio |
 
-            Flash via [Hapbeat Studio](https://devtools.hapbeat.com/studio/) — no PlatformIO required.
+            Flash via [Hapbeat Studio](https://studio.hapbeat.com) — no PlatformIO required.
           files: |
-            all-artifacts/*.bin
-            all-artifacts/manifest.json
+            release-artifacts/*.bin
+            release-artifacts/manifest.json
 
       - name: Trigger Studio redeploy
         run: |

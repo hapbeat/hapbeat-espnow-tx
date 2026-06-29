@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-env release semver — SOURCE OF TRUTH (DEC-035). Tags tx/<env>/vX.Y.Z are derived from this; if a tag disagrees, this file wins. Bump via scripts/bump_version.py; release via scripts/release-envs.sh. Keys MUST match platformio.ini env names exactly.",
+  "_repoShort": "tx",
+  "envs": {
+    "esp32": "0.1.0",
+    "m5stack_audio_tx": "0.1.0",
+    "m5stack_cores3_audio_tx": "0.1.0",
+    "m5stack_repeater": "0.1.0"
+  }
+}

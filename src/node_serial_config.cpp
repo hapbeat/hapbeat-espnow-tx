@@ -17,7 +17,10 @@
 #include "repeater.h"
 #endif
 
-static const char* FW_VERSION = "0.1.0";
+// FIRMWARE_VERSION / BUILD_COMMIT_SHA are auto-generated per env by
+// scripts/build_version.py (pre-build) from firmware-versions.json (DEC-035).
+// The header is gitignored and regenerated on every build.
+#include "build_version.h"
 
 // Determine build mode string at compile time.
 #if defined(AUDIO_SOURCE)
@@ -64,7 +67,7 @@ static void handleLine(const char* line) {
         JsonObject d = r["data"].to<JsonObject>();
         d["name"]      = "hapbeat-transmitter";
         d["mac"]       = WiFi.macAddress();
-        d["firmware"]  = FW_VERSION;
+        d["firmware"]  = FIRMWARE_VERSION;
         d["role"]      = "transmitter";
         d["transport"] = "espnow_stream";
         d["board"]     = "m5stack_basic";
