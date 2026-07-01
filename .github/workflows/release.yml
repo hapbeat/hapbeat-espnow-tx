@@ -16,7 +16,10 @@ name: Firmware Build & Release
 on:
   push:
     branches: [master]
-    tags: ['*/v*']
+    # `**` (not `*`) is required: GitHub tag globs treat `*` as NOT matching
+    # `/`, so `*/v*` would miss the 3-segment tag tx/<env>/vX.Y.Z. `**/v*`
+    # matches `<repoShort>/<env>/` then `v*`.
+    tags: ['**/v*']
   workflow_dispatch:
     inputs:
       tag_name:
