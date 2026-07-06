@@ -381,6 +381,13 @@ static es_mic_gain_t pgaFromLevel(int lvl) {
 }
 
 // ---- Opus encode (modes 1-3; CoreS3 only) ---------------------------------
+// libopus (NONTHREADSAFE_PSEUDOSTACK) keeps its temp buffers in ONE global
+// scratch, lazily malloc'd as opus_alloc_scratch(GLOBAL_STACK_SIZE=60000) on the
+// first encode. On the CoreS3 the internal heap is fragmented (M5GFX framebuffer
+// + Wi-Fi/ESP-NOW) so that 60 KB contiguous malloc FAILS → global_stack=NULL →
+// StoreProhibited on the first opus_encode. We pre-seed global_stack ourselves
+// (internal SRAM for speed; PSRAM fallback) before the first encode.
+extern "C" char* global_stack;
 static OpusEncoder* s_enc      = nullptr;
 static uint8_t      s_enc_mode = 0xFF;          // mode s_enc is configured for
 static int16_t      s_opusAccum[OPUS_MAX_SMP];  // 8 kHz mono frame accumulator
@@ -397,21 +404,35 @@ static int          s_opHistN      = 0;         // valid history entries (0..2)
 // INTERNAL SRAM (PSRAM wait states would ~2× the encode time — see gate①).
 static void opusEncoderConfig(uint8_t mode) {
     if (mode < MODE_L || mode >= MODE_COUNT) return;
+    // Pre-seed libopus's global scratch (see extern above) — internal SRAM for
+    // fast encode, PSRAM fallback if no 64 KB contiguous internal block remains.
+    if (!global_stack) {
+        global_stack = (char*)heap_caps_malloc(64 * 1024,
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!global_stack)
+            global_stack = (char*)heap_caps_malloc(128 * 1024, MALLOC_CAP_SPIRAM);
+        Serial.printf("[AUDIO-SRC] opus scratch @ %p (largest internal free %u)\n",
+                      (void*)global_stack,
+                      (unsigned)heap_caps_get_largest_free_block(
+                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
     if (!s_enc) {
+        // Create ONCE; reused for all Opus modes. Opus takes the frame size as a
+        // per-encode-call argument, so L/M/Q (40/40/80 samples, same bitrate)
+        // share one encoder — no per-switch reconfigure. (A RESET_STATE + re-ctl
+        // on the live switch was crashing the encoder mid-stream.)
         int sz = opus_encoder_get_size(1);
         s_enc = (OpusEncoder*)heap_caps_malloc((size_t)sz,
                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
         opus_encoder_init(s_enc, STREAM_OPUS_RATE, 1, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
-    } else {
-        opus_encoder_ctl(s_enc, OPUS_RESET_STATE);
+        opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
+        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));
+        opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
     }
-    opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
-    opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));
-    opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
-    s_enc_mode   = mode;
-    s_opusAccumN = 0;
-    s_opHistN    = 0;
+    s_enc_mode   = mode;   // switches opusPush8k's frame size to this mode
+    s_opusAccumN = 0;      // drop the partial frame from the old size
+    s_opHistN    = 0;      // old-size piggyback frames are invalid now
     s_decim2     = 0;
     Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz mono, %u smp, %u bps)\n",
                   MODE_NAME[mode], STREAM_OPUS_RATE, MODE_DEFS[mode].opus_frame,
@@ -731,12 +752,19 @@ void audioSourceSetMode(int mode) {
 #ifndef BOARD_CORES3
     if (mode != MODE_ADPCM) return;   // classic sender has no Opus encoder
 #endif
-    s_mode = (uint8_t)mode;
+    if ((uint8_t)mode == s_mode) return;   // no change
     Preferences p;
     p.begin("tx", false);
     p.putUChar("mode", (uint8_t)mode);
     p.end();
-    Serial.printf("[AUDIO-SRC] stream mode -> %s (%d)\n", MODE_NAME[mode], mode);
+    // Reboot into the new mode instead of live-switching. Re-initializing the
+    // Opus encoder for a new frame size mid-stream is unreliable on this codec
+    // build (crashes); a clean boot into each mode is proven stable. The ~2 s
+    // reboot is fine for a deliberate mode change (setup / A-B sensory test).
+    Serial.printf("[AUDIO-SRC] stream mode -> %s (%d), rebooting\n",
+                  MODE_NAME[mode], mode);
+    delay(150);       // flush serial + let the NVS commit settle
+    ESP.restart();
 }
 
 int audioSourceGetMode() { return s_mode; }
