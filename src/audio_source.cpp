@@ -39,6 +39,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <cstring>
@@ -638,7 +639,8 @@ static void displayCoreS3Diag() {
     auto& d = M5.Display;
     if (first) { d.fillScreen(TFT_BLACK); d.setTextSize(2); first = false; }
     d.setTextColor(TFT_CYAN, TFT_BLACK);
-    d.setCursor(4, 4);    d.printf("CoreS3 SRC 6M ");
+    d.setCursor(4, 4);    d.printf("MODE:%-5s CH:%-2u ",
+                                   MODE_NAME[s_mode < MODE_COUNT ? s_mode : 0], s_channel);
     d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
     d.setCursor(4, 30);   d.printf("buf(infl)=%-3d ", STREAM_MAX_INFLIGHT);
     d.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -657,7 +659,25 @@ void audioSourceLoop() {
     heartbeatTick();
 
 #ifdef BOARD_CORES3
-    // Capture/encode/send run in audioRxTask. Here we only refresh the LCD.
+    // Touch UI: tap the TOP half of the LCD to cycle stream mode (0→L→M→Q→0),
+    // the BOTTOM half to cycle channel (1→6→11). Capture/encode/send run in
+    // audioRxTask; here we only refresh the LCD + service touch.
+    M5.update();
+    if (M5.Touch.getCount() > 0) {
+        auto t = M5.Touch.getDetail(0);
+        if (t.wasReleased()) {
+            if (t.y < 120) {
+                audioSourceSetMode((audioSourceGetMode() + 1) % MODE_COUNT);
+            } else {
+                // cycle channel 1→6→11 (persist + live apply; peer re-add on reboot)
+                uint8_t nc = (s_channel == 1) ? 6 : (s_channel == 6) ? 11 : 1;
+                s_channel = nc;
+                Preferences p; p.begin("espnow", false); p.putUChar("channel", nc); p.end();
+                esp_wifi_set_channel(nc, WIFI_SECOND_CHAN_NONE);
+                Serial.printf("[AUDIO-SRC] channel -> %u (reboot to re-add peer)\n", nc);
+            }
+        }
+    }
     displayCoreS3Diag();
     delay(20);
 #else
