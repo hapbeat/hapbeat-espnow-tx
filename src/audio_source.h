@@ -19,4 +19,9 @@ void audioSourceLoop();
 // set_input_level. CoreS3 maps it to the ES8388 analog PGA gain.
 void audioSourceApplyInputLevel(int level);
 
+// Live stream-mode select: 0=ADPCM(compat), 1=L(low-latency), 2=M(middle),
+// 3=Q(quality). Persisted to NVS. Only ADPCM on the classic (non-CoreS3) sender.
+void audioSourceSetMode(int mode);
+int  audioSourceGetMode();
+
 #endif // AUDIO_SOURCE_H

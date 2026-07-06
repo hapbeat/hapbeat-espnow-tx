@@ -127,6 +127,19 @@ static void handleLine(const char* line) {
         return;
     }
 
+    // ---- set_stream_mode (0=ADPCM,1=L,2=M,3=Q) -----------------------------
+    if (strcmp(cmd, "set_stream_mode") == 0) {
+        int m = doc["mode"] | 0;
+#ifdef AUDIO_SOURCE
+        audioSourceSetMode(m);            // persists NVS + live-switches the encoder
+        r["status"] = "ok"; r["cmd"] = cmd; r["mode"] = audioSourceGetMode();
+#else
+        r["status"] = "error"; r["cmd"] = cmd; r["message"] = "not a source";
+#endif
+        sendResp(r);
+        return;
+    }
+
     // ---- set_relay_source --------------------------------------------------
     // Sets the source MAC to relay (for REPEATER builds; stored for all modes
     // so it survives a reflash to REPEATER firmware without reconfiguration).

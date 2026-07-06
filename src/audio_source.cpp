@@ -49,6 +49,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <math.h>
+#include "opus.h"            // Opus encode (DEC-042) — CoreS3 only
+#include <esp_heap_caps.h>   // MALLOC_CAP_INTERNAL for the encoder state
 #else
 #include <Wire.h>
 #endif
@@ -70,6 +72,31 @@ static const int      DECIMATE           = CAPTURE_RATE / STREAM_RATE;  // 3
 static const int      FRAMES_PKT         = 64;
 static const int      CAP_FRAMES         = FRAMES_PKT * DECIMATE;       // 48
 static const uint8_t  STREAM_TYPE        = 0xAA;
+
+// ---- Streaming modes (mode_id = 0xAA packet header byte [1]) ----------------
+// The sender picks the mode; the receiver reads mode_id and auto-adapts its
+// decode + jitter-buffer depth. Table MUST match device-firmware
+// espnow_stream.cpp MODE_DEFS. See docs/instructions-espnow-modes-button-ui-*.
+//   0 = ADPCM 16k stereo 64-frame(4ms)  pb1   compat / floor (classic + CoreS3)
+//   1 = OPUS  8k mono     40-smp(5ms)    pb1   L  low-latency
+//   2 = OPUS  8k mono     40-smp(5ms)    pb1   M  middle
+//   3 = OPUS  8k mono     80-smp(10ms)   pb2   Q  quality
+enum StreamMode : uint8_t { MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3, MODE_COUNT = 4 };
+struct ModeDef { uint8_t codec; uint16_t opus_frame; uint8_t piggyback; uint16_t bitrate; };
+// codec: 0 = ADPCM, 1 = OPUS. opus_frame = samples/frame at STREAM_OPUS_RATE.
+static const ModeDef MODE_DEFS[MODE_COUNT] = {
+    { 0,  0, 1,     0 },   // 0 ADPCM
+    { 1, 40, 1, 16000 },   // 1 L  5 ms
+    { 1, 40, 1, 16000 },   // 2 M  5 ms
+    { 1, 80, 2, 16000 },   // 3 Q 10 ms
+};
+static const char*   MODE_NAME[MODE_COUNT] = { "ADPCM", "L", "M", "Q" };
+static const uint16_t STREAM_OPUS_RATE     = 8000;   // Opus encode rate (mono)
+static const int      OPUS_MAX_LEN         = 120;    // max opus frame bytes (headroom)
+static const int      OPUS_MAX_SMP         = 80;     // max samples/frame (10 ms @8k)
+
+// Live-selectable current mode (NVS "tx"/"mode", default 0 = ADPCM known-good).
+static volatile uint8_t s_mode = MODE_ADPCM;
 
 // In-flight depth (send-queue buffer). With 6 Mbps a depth of ~3 already
 // sustains the 1000 pkt/s stream, but a few % still drop on jitter. For
@@ -139,6 +166,9 @@ static void audioOnSendCb(const uint8_t* /*mac*/, esp_now_send_status_t status) 
 // broadcast it as a 0xAA STREAM packet with optional piggyback. Shared by the
 // classic loop path and the CoreS3 RX task.
 // ---------------------------------------------------------------------------
+// Mode-aware 0xAA header: [0]=type [1]=mode_id [2]=seq [3]=pb_count.
+// ADPCM body (mode 0): [4]=num_frames(1B) [5..10]=state(6) [11..]=data(N)
+//                      then pb_count× [prev_seq(1)][state(6)][data(N)].
 static void streamEncodeAndSend(const int16_t* pcm) {
     // Snapshot encoder state BEFORE this block (goes into the header so the
     // receiver can re-sync per packet).
@@ -157,12 +187,13 @@ static void streamEncodeAndSend(const int16_t* pcm) {
         return;
     }
 
-    uint8_t pkt[10 + FRAMES_PKT + PIGGYBACK_HDR + FRAMES_PKT];  // max 49 B
+    uint8_t pkt[4 + 1 + FRAMES_PKT + PIGGYBACK_HDR + FRAMES_PKT];
     size_t  pkt_len = 0;
     pkt[pkt_len++] = STREAM_TYPE;
+    pkt[pkt_len++] = MODE_ADPCM;
     pkt[pkt_len++] = s_seq;
-    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT & 0xFF);
-    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT >> 8);
+    pkt[pkt_len++] = s_has_prev ? 1 : 0;          // pb_count
+    pkt[pkt_len++] = (uint8_t)FRAMES_PKT;         // num_frames (1 byte, ≤255)
     pkt[pkt_len++] = (uint8_t)(pre_l.predictor & 0xFF);
     pkt[pkt_len++] = (uint8_t)((pre_l.predictor >> 8) & 0xFF);
     pkt[pkt_len++] = pre_l.step_index;
@@ -348,11 +379,102 @@ static es_mic_gain_t pgaFromLevel(int lvl) {
     return (es_mic_gain_t)idx;
 }
 
+// ---- Opus encode (modes 1-3; CoreS3 only) ---------------------------------
+static OpusEncoder* s_enc      = nullptr;
+static uint8_t      s_enc_mode = 0xFF;          // mode s_enc is configured for
+static int16_t      s_opusAccum[OPUS_MAX_SMP];  // 8 kHz mono frame accumulator
+static int          s_opusAccumN = 0;
+static int          s_decim2     = 0;           // 16k→8k 2:1 decimation phase
+static int32_t      s_decim2prev = 0;           // 2-tap average state
+// Opus frame history for piggyback (hist[0]=most recent prev, hist[1]=older).
+static uint8_t      s_opHist[2][OPUS_MAX_LEN];
+static uint8_t      s_opHistLen[2] = {0, 0};
+static uint8_t      s_opHistSeq[2] = {0, 0};
+static int          s_opHistN      = 0;         // valid history entries (0..2)
+
+// (Re)configure the Opus encoder for `mode` (1-3). Encoder state lives in
+// INTERNAL SRAM (PSRAM wait states would ~2× the encode time — see gate①).
+static void opusEncoderConfig(uint8_t mode) {
+    if (mode < MODE_L || mode >= MODE_COUNT) return;
+    if (!s_enc) {
+        int sz = opus_encoder_get_size(1);
+        s_enc = (OpusEncoder*)heap_caps_malloc((size_t)sz,
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
+        opus_encoder_init(s_enc, STREAM_OPUS_RATE, 1, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
+    } else {
+        opus_encoder_ctl(s_enc, OPUS_RESET_STATE);
+    }
+    opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
+    opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));
+    opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
+    s_enc_mode   = mode;
+    s_opusAccumN = 0;
+    s_opHistN    = 0;
+    s_decim2     = 0;
+    Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz mono, %u smp, %u bps)\n",
+                  MODE_NAME[mode], STREAM_OPUS_RATE, MODE_DEFS[mode].opus_frame,
+                  MODE_DEFS[mode].bitrate);
+}
+
+// Assemble + broadcast one Opus 0xAA packet (mode 1-3) with piggyback.
+// Body: [4]=opus_len(1) [5..]=frame ; then pb× [prev_seq(1)][len(1)][data].
+static void sendOpusPacket(const uint8_t* frame, int flen) {
+    uint8_t mode = s_mode;
+    int depth = MODE_DEFS[mode].piggyback;
+    int pbn   = s_opHistN < depth ? s_opHistN : depth;
+
+    if (s_inflight >= STREAM_MAX_INFLIGHT) {
+        s_txDroppedBusy++;
+    } else {
+        uint8_t pkt[4 + 1 + OPUS_MAX_LEN + 2 * (2 + OPUS_MAX_LEN)];
+        size_t p = 0;
+        pkt[p++] = STREAM_TYPE;
+        pkt[p++] = mode;
+        pkt[p++] = s_seq;
+        pkt[p++] = (uint8_t)pbn;
+        pkt[p++] = (uint8_t)flen;
+        memcpy(pkt + p, frame, flen); p += flen;
+        // piggyback: previous pbn frames, OLDEST first (seq order for decode).
+        for (int h = pbn - 1; h >= 0; h--) {
+            pkt[p++] = s_opHistSeq[h];
+            pkt[p++] = s_opHistLen[h];
+            memcpy(pkt + p, s_opHist[h], s_opHistLen[h]); p += s_opHistLen[h];
+        }
+        s_inflight++;
+        esp_err_t e = esp_now_send(BROADCAST_MAC, pkt, p);
+        if (e != ESP_OK) { s_inflight--; s_txSendFail++; }
+        else s_txPktSent++;
+    }
+    // Record current frame into history (shift) + advance seq — done even on a
+    // busy-drop so the NEXT packet's piggyback can still recover this frame.
+    memcpy(s_opHist[1], s_opHist[0], s_opHistLen[0]);
+    s_opHistLen[1] = s_opHistLen[0]; s_opHistSeq[1] = s_opHistSeq[0];
+    memcpy(s_opHist[0], frame, (size_t)flen);
+    s_opHistLen[0] = (uint8_t)flen;  s_opHistSeq[0] = s_seq;
+    if (s_opHistN < 2) s_opHistN++;
+    s_seq++;
+}
+
+// Accumulate one 8 kHz mono sample; encode + send when a full frame is ready.
+static inline void opusPush8k(int16_t s) {
+    if (!s_enc || s_enc_mode < MODE_L) return;
+    s_opusAccum[s_opusAccumN++] = s;
+    int need = MODE_DEFS[s_enc_mode].opus_frame;
+    if (s_opusAccumN >= need) {
+        uint8_t buf[OPUS_MAX_LEN];
+        int n = opus_encode(s_enc, s_opusAccum, need, buf, sizeof(buf));
+        s_opusAccumN = 0;
+        if (n > 0) sendOpusPacket(buf, n);
+    }
+}
+
 // ---- CoreS3 capture task: raw i2s_read (small chunks) → FIR decimate → send -
 static void audioRxTask(void* /*arg*/) {
-    static int16_t accum[FRAMES_PKT * 2];   // 16 kHz stereo, one packet
+    static int16_t accum[FRAMES_PKT * 2];   // 16 kHz stereo, one ADPCM packet
     int accumIdx = 0;
     uint32_t dcount = 0;
+    uint8_t taskMode = 0xFF;                 // detect live mode switches
     static int16_t rx[FRAMES_PKT * 2];      // tiny read chunk (16 stereo frames)
     for (;;) {
         size_t br = 0;
@@ -378,11 +500,23 @@ static void audioRxTask(void* /*arg*/) {
                 dcyr = (float)r - dcxr + DCA * dcyr; dcxr = (float)r; r = (int32_t)dcyr;
                 if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
                 if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-                accum[accumIdx * 2]     = (int16_t)l;
-                accum[accumIdx * 2 + 1] = (int16_t)r;
-                if (++accumIdx >= FRAMES_PKT) {
-                    streamEncodeAndSend(accum);
+
+                // Route by the (live-switchable) stream mode.
+                uint8_t mode = s_mode;
+                if (mode != taskMode) {
                     accumIdx = 0;
+                    if (mode >= MODE_L) opusEncoderConfig(mode);
+                    taskMode = mode;
+                }
+                if (mode == MODE_ADPCM) {
+                    accum[accumIdx * 2]     = (int16_t)l;
+                    accum[accumIdx * 2 + 1] = (int16_t)r;
+                    if (++accumIdx >= FRAMES_PKT) { streamEncodeAndSend(accum); accumIdx = 0; }
+                } else {
+                    // downmix + 2:1 decimate 16k stereo → 8k mono (2-tap average).
+                    int32_t mono16 = ((int32_t)l + r) / 2;
+                    if (s_decim2 == 0) { s_decim2prev = mono16; s_decim2 = 1; }
+                    else { s_decim2 = 0; opusPush8k((int16_t)((s_decim2prev + mono16) / 2)); }
                 }
             }
         }
@@ -402,6 +536,8 @@ void audioSourceSetup() {
         p.end();
         p.begin("tx", true);
         s_input_level = p.getInt("input_level", 50);
+        s_mode        = p.getUChar("mode", MODE_ADPCM);
+        if (s_mode >= MODE_COUNT) s_mode = MODE_ADPCM;
         p.end();
     }
 
@@ -565,5 +701,24 @@ void audioSourceApplyInputLevel(int level) {
     if (s_codecOk) s_audio.setMicGain(pgaFromLevel(level));
 #endif
 }
+
+// Live stream-mode select (0=ADPCM, 1=L, 2=M, 3=Q). Persisted to NVS. On the
+// classic (non-CoreS3) sender only ADPCM (0) is available; Opus modes are
+// accepted but the classic loop still emits ADPCM (no encoder). The CoreS3
+// capture task reconfigures the Opus encoder on the next block.
+void audioSourceSetMode(int mode) {
+    if (mode < 0 || mode >= MODE_COUNT) return;
+#ifndef BOARD_CORES3
+    if (mode != MODE_ADPCM) return;   // classic sender has no Opus encoder
+#endif
+    s_mode = (uint8_t)mode;
+    Preferences p;
+    p.begin("tx", false);
+    p.putUChar("mode", (uint8_t)mode);
+    p.end();
+    Serial.printf("[AUDIO-SRC] stream mode -> %s (%d)\n", MODE_NAME[mode], mode);
+}
+
+int audioSourceGetMode() { return s_mode; }
 
 #endif // AUDIO_SOURCE
