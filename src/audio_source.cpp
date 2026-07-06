@@ -5,18 +5,27 @@
 // 48 kHz → 16 kHz, IMA-ADPCM-encodes, and broadcasts 0xAA stream packets
 // over ESP-NOW. See contracts/specs/espnow-stream.md.
 //
-// DEC-033 additions (2026-06-26):
-//  - Piggyback (§3.2): each packet carries the previous packet's data so
-//    the receiver can recover single-packet losses without silence.
-//  - In-flight control: STREAM_MAX_INFLIGHT=2 prevents piling up of
-//    unacknowledged sends; excess packets are dropped (encoder state still
-//    advances to keep the next packet valid).
-//  - WiFi.setSleep(false): eliminates modem-sleep jitter from Tx timing.
-//  - Minimal display stats updated at ~4 fps.
+// Shortest-path design (mirrors the reference wireless-sender-firmware
+// audioStreamSender, which is the latency-optimized origin):
+//   * Capture runs in a dedicated, core-pinned FreeRTOS task (not the Arduino
+//     loop) so scheduling jitter doesn't perturb timing.
+//   * Raw driver/i2s.h with SMALL DMA buffers (3 x 32) read in tiny chunks,
+//     to minimise capture/DMA latency (large buffers add ~10 ms).
+//   * Capture at 48 kHz and software-decimate 3:1 to 16 kHz — the ES8388's
+//     higher-rate decimation filter has lower group delay than at 16 kHz.
+//   * Line input = LINPUT1/RINPUT1 (the TRS line-in jack). LINPUT2 is the mic
+//     path and leaves a channel silent for line use.
+//   * ESP-NOW radio is configured for 6 Mbps in espnow_sender.cpp so the
+//     1000 pkt/s stream fits with a shallow in-flight depth (low latency).
 //
-// NOTE (hardware bring-up): ES8388 register sequence and I2S pin map below
-// are M5Stack Core + Module-Audio reference values. Confirm/tune against the
-// actual board and line level before use.
+// On classic M5Stack Core/Basic the same path uses a manual ES8388 register
+// init; on CoreS3 (-D BOARD_CORES3) the official M5Unified + M5Module-Audio
+// driver inits the codec only (board-correct I2C, STM32 input enable), while
+// the I2S is set up here so we control the DMA buffer size. CoreS3 keeps the
+// module's A/B switch on "A" (classic wiring) — see audioSourceSetup().
+//
+// Robustness (DEC-033): piggyback (§3.2) + bounded in-flight; encoder state
+// always advances even on a dropped packet so the next packet stays valid.
 // ---------------------------------------------------------------------------
 
 #include "audio_source.h"
@@ -28,32 +37,65 @@
 #include "ima_adpcm.h"
 
 #include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
-#include <driver/i2s.h>
 #include <esp_now.h>
 #include <Preferences.h>
+#include <driver/i2s.h>
 #include <cstring>
+
+#ifdef BOARD_CORES3
+#include <M5Unified.h>
+#include "M5Module_Audio.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <math.h>
+#else
+#include <Wire.h>
+#endif
 
 // ---- audio params (must match the receiver) --------------------------------
 static const uint32_t CAPTURE_RATE       = 48000;
 static const uint32_t STREAM_RATE        = 16000;
 static const int      DECIMATE           = CAPTURE_RATE / STREAM_RATE;  // 3
-static const int      FRAMES_PKT         = 16;
+// Frames per packet. The audible glitch every 100-300 ms was 2.4 GHz
+// interference on channel 1 (beacon-correlated bursts), NOT receiver-queue
+// overflow. Fix = move both nodes to channel 11 (set_espnow_channel).
+// On channel 11, LARGER packets recover better: interference bursts are
+// time-based (a few ms), so a 64-frame (4 ms) packet captures a burst as ONE
+// lost packet that the depth-1 piggyback recovers (measured 95% recovery,
+// 0.17% net, worst gap 8 ms). At 16 frames (1 ms) the same burst spans many
+// packets (measured maxgap 18 → 18 ms, only 53% recovered). So keep 64 (the
+// receiver's MAX_FRAMES). Residual = the rare 2-packet burst; deepen the
+// piggyback to depth 2 if it needs to be tighter. (Receiver reads num_frames.)
+static const int      FRAMES_PKT         = 64;
 static const int      CAP_FRAMES         = FRAMES_PKT * DECIMATE;       // 48
 static const uint8_t  STREAM_TYPE        = 0xAA;
-static const int      STREAM_MAX_INFLIGHT = 2;
+
+// In-flight depth (send-queue buffer). With 6 Mbps a depth of ~3 already
+// sustains the 1000 pkt/s stream, but a few % still drop on jitter. For
+// loss-isolation we run a deliberately deep buffer so sender drops -> ~0
+// (accepting more worst-case queue latency, shown on the LCD). Override per
+// build with -D STREAM_MAX_INFLIGHT=N.
+#ifndef STREAM_MAX_INFLIGHT
+#define STREAM_MAX_INFLIGHT 16
+#endif
 
 // Piggyback size: prev_seq(1) + prev_state(6) + prev_data(FRAMES_PKT) = 7+N
 static const int PIGGYBACK_HDR = 7;
 
-// ---- display update interval -----------------------------------------------
+// ---- display / heartbeat interval ------------------------------------------
 static const uint32_t DISPLAY_INTERVAL_MS = 250;  // ~4 fps
 
-// ---- ES8388 (M5 Module-Audio) — I2C + I2S pins ----------------------------
+#ifdef BOARD_CORES3
+// ---- M5 Module-Audio (ES8388) driver — used for CODEC init only ------------
+static M5ModuleAudio s_audio;
+static int s_i2s_din = -1;   // resolved at setup (M-Bus pin26)
+#else
+// ---- ES8388 (M5 Module-Audio) — I2C + I2S pins (Config A: Core/Basic) ------
 static const uint8_t  ES8388_ADDR = 0x10;
 static const int      I2C_SDA = 21, I2C_SCL = 22;
 static const int      I2S_MCLK = 0, I2S_BCLK = 13, I2S_LRCK = 12, I2S_DIN = 34;
+#endif
 
 // ---- runtime config (NVS) -------------------------------------------------
 static int     s_input_level = 50;   // 0..100, 50 = unity
@@ -64,15 +106,21 @@ static AdpcmState s_sl, s_sr;
 static uint8_t    s_seq = 0;
 
 // ---- in-flight control (shared with send callback in WiFi task) -----------
-// WiFi task is non-ISR but runs on a different FreeRTOS task; volatile is
-// sufficient for the simple counter. The worst-case race (incrementing just
-// as callback fires) causes at most one extra in-flight slot — acceptable.
 static volatile int      s_inflight      = 0;
 static volatile uint32_t s_txSendFail    = 0;
 static          uint32_t s_txDroppedBusy = 0;
 static          uint32_t s_txPktSent     = 0;
 
-// ---- piggyback state (saved from the last successfully enqueued packet) ---
+// ---- raw-input signal stats (raw L & R, pre-decimation) for the heartbeat --
+static          int32_t  s_lmin = 32767, s_lmax = -32768;
+static          int64_t  s_lsum = 0;
+static          int32_t  s_rmin = 32767, s_rmax = -32768;
+static          int64_t  s_rsum = 0;
+static          uint32_t s_scnt = 0;
+static          uint32_t s_capFail = 0;
+static          bool     s_codecOk = true;   // CoreS3: ES8388/STM32 begin() result
+
+// ---- piggyback state (saved from the last successfully enqueued packet) ----
 static bool       s_has_prev      = false;
 static uint8_t    s_prev_seq;
 static AdpcmState s_prev_sl, s_prev_sr;   // encoder state BEFORE that block
@@ -80,14 +128,110 @@ static uint8_t    s_prev_data[FRAMES_PKT];
 
 // ---------------------------------------------------------------------------
 // Send callback — registered in audioSourceSetup(), replaces EspNowSender's.
-// Called from WiFi task after each esp_now_send() completes (success or fail).
 // ---------------------------------------------------------------------------
 static void audioOnSendCb(const uint8_t* /*mac*/, esp_now_send_status_t status) {
     if (s_inflight > 0) s_inflight--;
     if (status != ESP_NOW_SEND_SUCCESS) s_txSendFail++;
 }
 
-// ---- ES8388 helpers --------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Encode one 16 kHz stereo block (FRAMES_PKT frames, interleaved L,R) and
+// broadcast it as a 0xAA STREAM packet with optional piggyback. Shared by the
+// classic loop path and the CoreS3 RX task.
+// ---------------------------------------------------------------------------
+static void streamEncodeAndSend(const int16_t* pcm) {
+    // Snapshot encoder state BEFORE this block (goes into the header so the
+    // receiver can re-sync per packet).
+    AdpcmState pre_l = s_sl, pre_r = s_sr;
+
+    // Always encode (advances state) even if we then drop, so the next packet's
+    // header reflects the correct predictor state.
+    uint8_t data[FRAMES_PKT];
+    adpcmEncodeBlockStereo(pcm, data, FRAMES_PKT, &s_sl, &s_sr);
+
+    // In-flight cap: drop if too many unacknowledged sends; bump seq so the
+    // receiver sees a gap (handled as loss) rather than corruption.
+    if (s_inflight >= STREAM_MAX_INFLIGHT) {
+        s_txDroppedBusy++;
+        s_seq++;
+        return;
+    }
+
+    uint8_t pkt[10 + FRAMES_PKT + PIGGYBACK_HDR + FRAMES_PKT];  // max 49 B
+    size_t  pkt_len = 0;
+    pkt[pkt_len++] = STREAM_TYPE;
+    pkt[pkt_len++] = s_seq;
+    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT & 0xFF);
+    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT >> 8);
+    pkt[pkt_len++] = (uint8_t)(pre_l.predictor & 0xFF);
+    pkt[pkt_len++] = (uint8_t)((pre_l.predictor >> 8) & 0xFF);
+    pkt[pkt_len++] = pre_l.step_index;
+    pkt[pkt_len++] = (uint8_t)(pre_r.predictor & 0xFF);
+    pkt[pkt_len++] = (uint8_t)((pre_r.predictor >> 8) & 0xFF);
+    pkt[pkt_len++] = pre_r.step_index;
+    memcpy(pkt + pkt_len, data, FRAMES_PKT);
+    pkt_len += FRAMES_PKT;
+
+    if (s_has_prev) {
+        pkt[pkt_len++] = s_prev_seq;
+        pkt[pkt_len++] = (uint8_t)(s_prev_sl.predictor & 0xFF);
+        pkt[pkt_len++] = (uint8_t)((s_prev_sl.predictor >> 8) & 0xFF);
+        pkt[pkt_len++] = s_prev_sl.step_index;
+        pkt[pkt_len++] = (uint8_t)(s_prev_sr.predictor & 0xFF);
+        pkt[pkt_len++] = (uint8_t)((s_prev_sr.predictor >> 8) & 0xFF);
+        pkt[pkt_len++] = s_prev_sr.step_index;
+        memcpy(pkt + pkt_len, s_prev_data, FRAMES_PKT);
+        pkt_len += FRAMES_PKT;
+    }
+
+    s_inflight++;
+    esp_err_t send_err = esp_now_send(BROADCAST_MAC, pkt, pkt_len);
+    if (send_err != ESP_OK) {
+        s_inflight--;
+        s_txSendFail++;
+    } else {
+        s_txPktSent++;
+        s_has_prev   = true;
+        s_prev_seq   = s_seq;
+        s_prev_sl    = pre_l;
+        s_prev_sr    = pre_r;
+        memcpy(s_prev_data, data, FRAMES_PKT);
+    }
+    s_seq++;
+}
+
+// Accumulate raw-input stats (raw L & R samples) for the heartbeat diagnostic.
+static inline void rawStat(int16_t l, int16_t r) {
+    if (l < s_lmin) s_lmin = l;
+    if (l > s_lmax) s_lmax = l;
+    s_lsum += l;
+    if (r < s_rmin) s_rmin = r;
+    if (r > s_rmax) s_rmax = r;
+    s_rsum += r;
+    s_scnt++;
+}
+
+// Periodic serial heartbeat (~2 s) for headless verification.
+static void heartbeatTick() {
+    static uint32_t s_last_hb = 0;
+    uint32_t now = millis();
+    if (now - s_last_hb < 2000) return;
+    s_last_hb = now;
+    long lmean = s_scnt ? (long)(s_lsum / (int64_t)s_scnt) : 0;
+    long rmean = s_scnt ? (long)(s_rsum / (int64_t)s_scnt) : 0;
+    Serial.printf("[AUDIO-SRC] hb codec=%d pkt=%u capfail=%u drop=%u fail=%u "
+                  "L[%ld..%ld m%ld] R[%ld..%ld m%ld]\n",
+                  s_codecOk ? 1 : 0,
+                  s_txPktSent, s_capFail, s_txDroppedBusy, (uint32_t)s_txSendFail,
+                  (long)s_lmin, (long)s_lmax, lmean,
+                  (long)s_rmin, (long)s_rmax, rmean);
+    s_lmin = 32767; s_lmax = -32768; s_lsum = 0;
+    s_rmin = 32767; s_rmax = -32768; s_rsum = 0;
+    s_scnt = 0;
+}
+
+#ifndef BOARD_CORES3
+// ---- ES8388 helpers (classic Core/Basic only) -----------------------------
 static void es8388Write(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(ES8388_ADDR);
     Wire.write(reg);
@@ -95,8 +239,7 @@ static void es8388Write(uint8_t reg, uint8_t val) {
     Wire.endTransmission();
 }
 
-// Minimal ES8388 line-in → ADC → I2S record config. Register values follow
-// the common ES8388 record recipe; tune on hardware (input select / gain).
+// Minimal ES8388 line-in → ADC → I2S record config (LINPUT1/RINPUT1).
 static void es8388Init() {
     es8388Write(0x00, 0x80); delay(10);   // reset
     es8388Write(0x00, 0x00);
@@ -113,27 +256,46 @@ static void es8388Init() {
     es8388Write(0x10, 0x00);              // ADC L volume 0 dB
     es8388Write(0x11, 0x00);              // ADC R volume 0 dB
 }
+#endif // !BOARD_CORES3
 
-static void i2sRxInit() {
+// ---- I2S RX init (raw driver, small DMA buffers) — Core/Basic AND CoreS3 ----
+// RX-only master, mirroring the reference wireless-sender-firmware. The I2S
+// master generates MCLK on `mck` regardless of TX, so the ES8388 is clocked
+// (verified: switch A → MCLK on GPIO0). Small DMA buffers keep capture latency
+// low; empirically this RX-only/small-buffer path also keeps the 6 Mbps
+// ESP-NOW rate effective (the M5 driver's TX|RX + large-buffer path did not).
+static void i2sRxInit(int mck, int bck, int ws, int din) {
     i2s_config_t cfg = {};
-    cfg.mode              = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-    cfg.sample_rate       = CAPTURE_RATE;
-    cfg.bits_per_sample   = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format    = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    cfg.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    cfg.sample_rate          = CAPTURE_RATE;
+    cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags  = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count     = 4;
-    cfg.dma_buf_len       = 256;
-    cfg.use_apll          = true;
-    cfg.tx_desc_auto_clear = false;
-    cfg.fixed_mclk        = 0;
+    cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count        = 3;    // small buffers → low capture latency
+    cfg.dma_buf_len          = 32;   // tiny read chunk (~0.67 ms @ 48 kHz)
+#ifdef BOARD_CORES3
+    // ESP32-S3: APLL-derived MCLK can fail to clock the ES8388 (DIN reads 0).
+    // The M5Module-Audio driver uses the non-APLL path on S3 and clocks fine.
+    cfg.use_apll             = false;
+#else
+    cfg.use_apll             = true;   // classic ESP32: APLL low-jitter MCLK
+#endif
+    cfg.tx_desc_auto_clear   = true;
+    cfg.fixed_mclk           = 0;
+
+#if !defined(BOARD_CORES3) && defined(CONFIG_IDF_TARGET_ESP32)
+    // Classic ESP32 needs GPIO0 routed to CLK_OUT1 for MCLK.
+    PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO0_U, FUNC_GPIO0_CLK_OUT1);
+    WRITE_PERI_REG(PIN_CTRL, 0xFFF0);
+#endif
 
     i2s_pin_config_t pins = {};
-    pins.mck_io_num    = I2S_MCLK;
-    pins.bck_io_num    = I2S_BCLK;
-    pins.ws_io_num     = I2S_LRCK;
-    pins.data_out_num  = I2S_PIN_NO_CHANGE;
-    pins.data_in_num   = I2S_DIN;
+    pins.mck_io_num   = mck;
+    pins.bck_io_num   = bck;
+    pins.ws_io_num    = ws;
+    pins.data_out_num = I2S_PIN_NO_CHANGE;
+    pins.data_in_num  = din;
 
     i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
     i2s_set_pin(I2S_NUM_0, &pins);
@@ -141,9 +303,98 @@ static void i2sRxInit() {
                 I2S_CHANNEL_STEREO);
 }
 
+#ifdef BOARD_CORES3
+// ---- Anti-alias decimation FIR (48 kHz -> 16 kHz, /3) -----------------------
+// The previous 3-tap box average is a poor LPF (~-13 dB stopband), so content
+// in 8-24 kHz folds back into 0-8 kHz as a high-frequency "sizzle". This is a
+// proper windowed-sinc low-pass (Hann), run as a decimating FIR.
+static const int FIR_TAPS = 21;
+static float   s_firCoef[FIR_TAPS];
+static int16_t s_firHL[FIR_TAPS];
+static int16_t s_firHR[FIR_TAPS];
+
+static void firInit() {
+    const float PI_F = 3.14159265358979f;
+    const float fc = 6500.0f, fs = 48000.0f;   // cutoff well below the 8 kHz out-Nyquist
+    float sum = 0.0f;
+    for (int n = 0; n < FIR_TAPS; n++) {
+        float m = (float)n - (FIR_TAPS - 1) * 0.5f;
+        float s = (m == 0.0f) ? (2.0f * fc / fs)
+                              : sinf(2.0f * PI_F * fc / fs * m) / (PI_F * m);
+        float w = 0.5f - 0.5f * cosf(2.0f * PI_F * (float)n / (FIR_TAPS - 1)); // Hann
+        s_firCoef[n] = s * w;
+        sum += s_firCoef[n];
+    }
+    for (int n = 0; n < FIR_TAPS; n++) s_firCoef[n] /= sum;   // unity DC gain
+    for (int n = 0; n < FIR_TAPS; n++) { s_firHL[n] = 0; s_firHR[n] = 0; }
+}
+
+static inline void firPush(int16_t l, int16_t r) {
+    for (int i = 0; i < FIR_TAPS - 1; i++) { s_firHL[i] = s_firHL[i+1]; s_firHR[i] = s_firHR[i+1]; }
+    s_firHL[FIR_TAPS-1] = l; s_firHR[FIR_TAPS-1] = r;
+}
+static inline void firGet(int32_t* ol, int32_t* outr) {
+    float al = 0.0f, ar = 0.0f;
+    for (int i = 0; i < FIR_TAPS; i++) { al += s_firCoef[i] * s_firHL[i]; ar += s_firCoef[i] * s_firHR[i]; }
+    *ol = (int32_t)al; *outr = (int32_t)ar;
+}
+
+// input_level (0-100) -> analog input PGA gain. 50 = 0 dB (preserves a healthy
+// source level / no clipping); >50 adds up to +24 dB for quiet sources.
+static es_mic_gain_t pgaFromLevel(int lvl) {
+    int idx = (lvl - 50) * 8 / 50;
+    if (idx < 0) idx = 0;
+    if (idx > 8) idx = 8;
+    return (es_mic_gain_t)idx;
+}
+
+// ---- CoreS3 capture task: raw i2s_read (small chunks) → FIR decimate → send -
+static void audioRxTask(void* /*arg*/) {
+    static int16_t accum[FRAMES_PKT * 2];   // 16 kHz stereo, one packet
+    int accumIdx = 0;
+    uint32_t dcount = 0;
+    static int16_t rx[FRAMES_PKT * 2];      // tiny read chunk (16 stereo frames)
+    for (;;) {
+        size_t br = 0;
+        esp_err_t e = i2s_read(I2S_NUM_0, rx, sizeof(rx), &br, portMAX_DELAY);
+        if (e != ESP_OK || br < 4) { s_capFail++; vTaskDelay(1); continue; }
+        size_t n = br / sizeof(int16_t);
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            // L/R swapped vs the raw I2S slot order (receiver was reversed).
+            int16_t L = rx[i + 1];
+            int16_t R = rx[i];
+            rawStat(L, R);
+            firPush(L, R);
+            if (++dcount >= (uint32_t)DECIMATE) {
+                dcount = 0;
+                int32_t l, r;
+                firGet(&l, &r);          // gain is analog (PGA); FIR is unity DC
+                // DC blocker (1-pole HPF ~10 Hz). With ALC off the ES8388's DC
+                // servo is gone, exposing an ADC DC offset — remove it so no DC
+                // reaches the motor. Transparent above ~30 Hz.
+                static float dcxl = 0, dcyl = 0, dcxr = 0, dcyr = 0;
+                const float DCA = 0.996f;
+                dcyl = (float)l - dcxl + DCA * dcyl; dcxl = (float)l; l = (int32_t)dcyl;
+                dcyr = (float)r - dcxr + DCA * dcyr; dcxr = (float)r; r = (int32_t)dcyr;
+                if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+                if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+                accum[accumIdx * 2]     = (int16_t)l;
+                accum[accumIdx * 2 + 1] = (int16_t)r;
+                if (++accumIdx >= FRAMES_PKT) {
+                    streamEncodeAndSend(accum);
+                    accumIdx = 0;
+                }
+            }
+        }
+    }
+}
+#endif // BOARD_CORES3
+
 // ---------------------------------------------------------------------------
 void audioSourceSetup() {
-    // Load runtime config from NVS
+    // Performance-first: source/repeater are mains-powered, so never downclock.
+    setCpuFrequencyMhz(240);
+
     {
         Preferences p;
         p.begin("espnow", true);
@@ -154,18 +405,76 @@ void audioSourceSetup() {
         p.end();
     }
 
-    // Disable modem sleep to eliminate Tx timing jitter (contracts §4 / DEC-033).
-    WiFi.setSleep(false);
-
-    // Replace EspNowSender's send callback with ours to track in-flight count.
-    // EspNowSender.init() was already called in main.cpp setup() before us.
+    // EspNowSender::init() (main.cpp) already did WiFi STA + radio tuning
+    // (6 Mbps, PS off) + esp_now_init. Replace its send callback with ours so
+    // we can track in-flight depth.
     esp_now_register_send_cb(audioOnSendCb);
 
-    Wire.begin(I2C_SDA, I2C_SCL);
-    es8388Init();
-    i2sRxInit();
     adpcmStateInit(&s_sl);
     adpcmStateInit(&s_sr);
+
+#ifdef BOARD_CORES3
+    // Keep the Module Audio A/B switch on "A" (classic wiring). A/B only swaps
+    // which M-Bus pin carries SCLK vs MCLK; the ESP32-S3 GPIO matrix lets us
+    // drive them on the A-position pins, so the same module also works on a
+    // Basic/Core2 without flipping the switch. Use the M5 driver for CODEC init
+    // only (board-correct I2C + STM32 input enable); we own the I2S below so we
+    // can use small DMA buffers. M5.begin() (main.cpp) powered the M-Bus.
+    int sda = M5.getPin(m5::pin_name_t::in_i2c_sda);
+    int scl = M5.getPin(m5::pin_name_t::in_i2c_scl);
+    int bck = M5.getPin(m5::pin_name_t::mbus_pin22);  // SCLK  (switch A)
+    int mck = M5.getPin(m5::pin_name_t::mbus_pin24);  // MCLK  (switch A)
+    int ws  = M5.getPin(m5::pin_name_t::mbus_pin21);  // LRCK   (A/B same)
+    s_i2s_din = M5.getPin(m5::pin_name_t::mbus_pin26); // ADC DIN (A/B same)
+    Serial.printf("[AUDIO-SRC] CoreS3 pins SDA=%d SCL=%d BCK=%d MCK=%d WS=%d DIN=%d\n",
+                  sda, scl, bck, mck, ws, s_i2s_din);
+
+    // CODEC-only begin (5-arg: I2C + ES8388 init + STM32 check; does NOT install
+    // I2S — i2sRxInit() below owns the I2S so we can use small DMA buffers).
+    // Settle after M5.begin() (AXP2101) and retry; the ES8388 can miss I2C right
+    // after power-up.
+    delay(100);
+    s_codecOk = false;
+    for (int attempt = 0; attempt < 5 && !s_codecOk; ++attempt) {
+        s_codecOk = s_audio.begin(Wire, (uint8_t)sda, (uint8_t)scl, 0x33, 400000);
+        if (!s_codecOk) {
+            Serial.printf("[AUDIO-SRC] ES8388 begin failed, retry %d/5\n", attempt + 1);
+            delay(120);
+        }
+    }
+    if (!s_codecOk) {
+        Serial.println("[AUDIO-SRC] Module Audio (ES8388/STM32) NOT found "
+                       "(check switch=A, module seated)");
+        displayError("MODULE AUDIO NOT FOUND");
+    } else {
+        s_audio.setMICStatus(AUDIO_MIC_OPEN);                 // STM32: open input
+        s_audio.setMicInputLine(ADC_INPUT_LINPUT1_RINPUT1);   // TRS line-in (both ch)
+        s_audio.setMicGain(pgaFromLevel(s_input_level));      // analog PGA from input_level
+        s_audio.setMicAdcVolume(100);                         // digital ADC vol = 0 dB (max)
+        s_audio.setBitsSample(ES_MODULE_ADC, BIT_LENGTH_16BITS);
+        s_audio.setSampleRate(SAMPLE_RATE_48K);               // codec ADC @ 48 kHz
+        // Disable ALC. The M5 driver's ES8388 init() enables stereo ALC "for
+        // VOICE" (reg 0x0E=0xEA). Line-in does NOT want auto-leveling — ALC rides
+        // the gain and pumps on sustained tones (adds noise) and can skew L/R.
+        // reg 0x0E bits[7:6]=00 = ALC off; fixed PGA (setMicGain) then applies.
+        Wire.beginTransmission(0x10);   // ES8388 I2C address
+        Wire.write(0x0E); Wire.write(0x00);
+        Wire.endTransmission();
+        Serial.printf("[AUDIO-SRC] ES8388 ready (CoreS3, switch A), PGA idx=%d, ALC off\n",
+                      (int)pgaFromLevel(s_input_level));
+    }
+
+    firInit();
+    // Raw RX-only I2S with small DMA buffers (switch-A SCLK/MCLK pins).
+    i2sRxInit(mck, bck, ws, s_i2s_din);
+
+    // Dedicated capture task, pinned to core 1 (WiFi/ESP-NOW runs on core 0).
+    xTaskCreatePinnedToCore(audioRxTask, "audioRx", 8192, nullptr, 18, nullptr, 1);
+#else
+    Wire.begin(I2C_SDA, I2C_SCL);
+    es8388Init();
+    i2sRxInit(I2S_MCLK, I2S_BCLK, I2S_LRCK, I2S_DIN);
+#endif
 
     Serial.printf("[AUDIO-SRC] ch=%u capture=%u Hz -> stream=%u Hz, "
                   "input_level=%d, max_inflight=%d\n",
@@ -173,20 +482,57 @@ void audioSourceSetup() {
                   s_input_level, STREAM_MAX_INFLIGHT);
 }
 
-// ---------------------------------------------------------------------------
-// Read one packet's worth of audio, decimate, encode, and broadcast.
+#ifdef BOARD_CORES3
+// On-screen diagnostic (CoreS3 LCD): buffer depth + estimated TX-side latency,
+// send rate, drop count, and L/R peak. fillScreen once then opaque fixed-width
+// overwrites (no flicker).
+static void displayCoreS3Diag() {
+    static uint32_t last = 0, lastPkt = 0;
+    static bool first = true;
+    uint32_t now = millis();
+    if (now - last < 400) return;
+    uint32_t dt = now - last; last = now;
+    uint32_t pps = dt ? (uint32_t)((uint64_t)(s_txPktSent - lastPkt) * 1000 / dt) : 0;
+    lastPkt = s_txPktSent;
+
+    const int capMs  = (int)((3 * 32 * 1000) / CAPTURE_RATE);        // DMA capture ~2 ms
+    const int pktMs  = (int)((FRAMES_PKT * 1000) / STREAM_RATE);     // 1 ms / packet
+    const int estLat = capMs + pktMs + STREAM_MAX_INFLIGHT * pktMs;  // worst-case TX-side
+
+    auto& d = M5.Display;
+    if (first) { d.fillScreen(TFT_BLACK); d.setTextSize(2); first = false; }
+    d.setTextColor(TFT_CYAN, TFT_BLACK);
+    d.setCursor(4, 4);    d.printf("CoreS3 SRC 6M ");
+    d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
+    d.setCursor(4, 30);   d.printf("buf(infl)=%-3d ", STREAM_MAX_INFLIGHT);
+    d.setTextColor(TFT_WHITE, TFT_BLACK);
+    d.setCursor(4, 56);   d.printf("estTX ~%-3dms ", estLat);
+    d.setCursor(4, 82);   d.printf("pkt/s %-4lu ", (unsigned long)pps);
+    d.setTextColor(s_txDroppedBusy ? TFT_YELLOW : TFT_GREEN, TFT_BLACK);
+    d.setCursor(4, 108);  d.printf("drop %-7lu ", (unsigned long)s_txDroppedBusy);
+    d.setTextColor(TFT_WHITE, TFT_BLACK);
+    d.setCursor(4, 134);  d.printf("Lpk%-6d ", (int)s_lmax);
+    d.setCursor(4, 160);  d.printf("Rpk%-6d ", (int)s_rmax);
+}
+#endif
+
 // ---------------------------------------------------------------------------
 void audioSourceLoop() {
+    heartbeatTick();
+
+#ifdef BOARD_CORES3
+    // Capture/encode/send run in audioRxTask. Here we only refresh the LCD.
+    displayCoreS3Diag();
+    delay(20);
+#else
     static int16_t cap[CAP_FRAMES * 2];   // interleaved L,R @ 48 kHz
     static int16_t pcm[FRAMES_PKT * 2];   // interleaved L,R @ 16 kHz
 
-    // Read a packet's worth of raw audio from DMA
     size_t bytes_read = 0;
     esp_err_t err = i2s_read(I2S_NUM_0, cap, sizeof(cap),
                               &bytes_read, pdMS_TO_TICKS(50));
-    if (err != ESP_OK || bytes_read < sizeof(cap)) return;
+    if (err != ESP_OK || bytes_read < sizeof(cap)) { s_capFail++; return; }
 
-    // Box-filter decimate 48→16 kHz and apply input_level gain.
     for (int o = 0; o < FRAMES_PKT; o++) {
         int32_t accL = 0, accR = 0;
         for (int k = 0; k < DECIMATE; k++) {
@@ -194,6 +540,7 @@ void audioSourceLoop() {
             accL += cap[idx];
             accR += cap[idx + 1];
         }
+        rawStat(cap[o * DECIMATE * 2], cap[o * DECIMATE * 2 + 1]);
         int32_t l = (accL / DECIMATE) * s_input_level / 50;
         int32_t r = (accR / DECIMATE) * s_input_level / 50;
         if (l > 32767)  l = 32767;  else if (l < -32768) l = -32768;
@@ -202,84 +549,21 @@ void audioSourceLoop() {
         pcm[o * 2 + 1] = (int16_t)r;
     }
 
-    // Snapshot encoder state BEFORE this block — this is what goes into the
-    // packet header so the receiver can re-sync from each packet independently.
-    AdpcmState pre_l = s_sl, pre_r = s_sr;
+    streamEncodeAndSend(pcm);
+#endif
+}
 
-    // Encode (must advance encoder state even when we decide to drop the packet
-    // so that the next packet's header reflects the correct predictor state).
-    uint8_t data[FRAMES_PKT];
-    adpcmEncodeBlockStereo(pcm, data, FRAMES_PKT, &s_sl, &s_sr);
-
-    // In-flight control: drop if too many unacknowledged sends outstanding.
-    // Still increment seq so the receiver sees a gap (handled as packet loss)
-    // rather than corruption.
-    if (s_inflight >= STREAM_MAX_INFLIGHT) {
-        s_txDroppedBusy++;
-        s_seq++;
-        return;
-    }
-
-    // Build STREAM packet with optional piggyback (contracts espnow-stream.md §3).
-    // Max size: header(10) + data(N) + piggyback_hdr(7) + piggyback_data(N) = 17+2N
-    // For N=16: 49 bytes — well within the 250-byte ESP-NOW limit.
-    uint8_t pkt[10 + FRAMES_PKT + PIGGYBACK_HDR + FRAMES_PKT];
-    size_t  pkt_len = 0;
-
-    pkt[pkt_len++] = STREAM_TYPE;
-    pkt[pkt_len++] = s_seq;
-    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT & 0xFF);
-    pkt[pkt_len++] = (uint8_t)(FRAMES_PKT >> 8);
-    pkt[pkt_len++] = (uint8_t)(pre_l.predictor & 0xFF);
-    pkt[pkt_len++] = (uint8_t)((pre_l.predictor >> 8) & 0xFF);
-    pkt[pkt_len++] = pre_l.step_index;
-    pkt[pkt_len++] = (uint8_t)(pre_r.predictor & 0xFF);
-    pkt[pkt_len++] = (uint8_t)((pre_r.predictor >> 8) & 0xFF);
-    pkt[pkt_len++] = pre_r.step_index;
-    memcpy(pkt + pkt_len, data, FRAMES_PKT);
-    pkt_len += FRAMES_PKT;
-
-    // Piggyback §3.2: append previous packet so receiver can recover single losses.
-    if (s_has_prev) {
-        pkt[pkt_len++] = s_prev_seq;
-        // prev_state: L predictor (2B LE), L step (1B), R predictor (2B LE), R step (1B)
-        pkt[pkt_len++] = (uint8_t)(s_prev_sl.predictor & 0xFF);
-        pkt[pkt_len++] = (uint8_t)((s_prev_sl.predictor >> 8) & 0xFF);
-        pkt[pkt_len++] = s_prev_sl.step_index;
-        pkt[pkt_len++] = (uint8_t)(s_prev_sr.predictor & 0xFF);
-        pkt[pkt_len++] = (uint8_t)((s_prev_sr.predictor >> 8) & 0xFF);
-        pkt[pkt_len++] = s_prev_sr.step_index;
-        memcpy(pkt + pkt_len, s_prev_data, FRAMES_PKT);
-        pkt_len += FRAMES_PKT;
-    }
-
-    // Reserve in-flight slot before sending (decrement in callback if send fails).
-    s_inflight++;
-    esp_err_t send_err = esp_now_send(BROADCAST_MAC, pkt, pkt_len);
-    if (send_err != ESP_OK) {
-        // esp_now_send failed synchronously — callback will NOT fire, so release slot.
-        s_inflight--;
-        s_txSendFail++;
-    } else {
-        // Packet enqueued: save state for next packet's piggyback.
-        s_txPktSent++;
-        s_has_prev   = true;
-        s_prev_seq   = s_seq;
-        s_prev_sl    = pre_l;
-        s_prev_sr    = pre_r;
-        memcpy(s_prev_data, data, FRAMES_PKT);
-    }
-    s_seq++;
-
-    // Periodic display update (~4 fps).
-    static uint32_t s_last_display = 0;
-    uint32_t now = millis();
-    if (now - s_last_display >= DISPLAY_INTERVAL_MS) {
-        s_last_display = now;
-        displayUpdateAudioStats(s_channel, s_input_level, s_txPktSent,
-                                s_inflight, s_txDroppedBusy,
-                                (uint32_t)s_txSendFail);
-    }
+// ---------------------------------------------------------------------------
+// Live input-level update (Studio set_input_level). On CoreS3 this drives the
+// ES8388 analog PGA gain (better SNR than digital); on classic it scales the
+// decimated PCM. 50 = unity / 0 dB.
+void audioSourceApplyInputLevel(int level) {
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    s_input_level = level;
+#ifdef BOARD_CORES3
+    if (s_codecOk) s_audio.setMicGain(pgaFromLevel(level));
+#endif
 }
 
 #endif // AUDIO_SOURCE

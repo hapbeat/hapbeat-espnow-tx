@@ -15,4 +15,8 @@
 void audioSourceSetup();
 void audioSourceLoop();
 
+// Apply a new input level (0-100, 50 = unity) live, e.g. from Studio's
+// set_input_level. CoreS3 maps it to the ES8388 analog PGA gain.
+void audioSourceApplyInputLevel(int level);
+
 #endif // AUDIO_SOURCE_H

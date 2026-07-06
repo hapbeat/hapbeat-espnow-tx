@@ -1,5 +1,9 @@
 #include <Arduino.h>
+#ifdef BOARD_CORES3
+#include <M5Unified.h>   // CoreS3: M5Unified (classic M5Stack lib is unsupported)
+#else
 #include <M5Stack.h>
+#endif
 #include "config.h"
 #include "types.h"
 #include "serial_handler.h"
@@ -15,22 +19,35 @@
 #include "repeater.h"
 #endif
 
-// Global instances (Bridge relay path only)
-static SerialHandler      serialHandler;
+// ESP-NOW sender — used by all build variants (Bridge relay / audio source / repeater).
 static EspNowSender       espNowSender;
-static TimeSync           timeSync;
-static CommandDispatcher   dispatcher;
 
-// Periodic status report timing (Bridge relay path only)
+// Bridge-relay-only globals. The AUDIO_SOURCE / REPEATER builds return early and
+// never use these; excluding them also keeps the HardwareSerial-based SerialHandler
+// out of the CoreS3 build (where Serial is USB-CDC / HWCDC, not HardwareSerial).
+#if !defined(AUDIO_SOURCE) && !defined(REPEATER)
+#define BRIDGE_RELAY 1
+static SerialHandler       serialHandler;
+static TimeSync            timeSync;
+static CommandDispatcher   dispatcher;
 static uint32_t lastStatusReport = 0;
 static constexpr uint32_t DISPLAY_UPDATE_MS = 500;
-
 // Serial connection timeout: if no frame received within this period, consider disconnected
 static constexpr uint32_t SERIAL_CONNECT_TIMEOUT_MS = 5000;
+#endif
 
 void setup() {
-    // Initialize M5Stack (LCD, SD, Serial, I2C)
+    // Initialize the M5 board.
+#ifdef BOARD_CORES3
+    // CoreS3: M5Unified auto-detects the board and brings up the AXP2101 PMIC
+    // (which powers the M-Bus / Module Audio), the display, and internal I2C.
+    auto m5cfg = M5.config();
+    m5cfg.serial_baudrate = SERIAL_BAUD;
+    M5.begin(m5cfg);
+#else
+    // Classic Core/Basic (M5Stack library).
     M5.begin(true, false, true, false);  // LCD=true, SD=false, Serial=true, I2C=false
+#endif
 
     displayInit();
     displayBootStatus("Serial init...");
@@ -66,6 +83,7 @@ void setup() {
     return;
 #endif
 
+#ifdef BRIDGE_RELAY
     // ---- Bridge command relay path ----------------------------------------
     serialHandler.init(Serial);
 
@@ -87,6 +105,7 @@ void setup() {
     displayBootStatus("Ready. Waiting for Bridge.");
     log_i("Transmitter ready. Waiting for commands from Bridge.");
     lastStatusReport = millis();
+#endif // BRIDGE_RELAY
 }
 
 void loop() {
@@ -104,6 +123,7 @@ void loop() {
     return;
 #endif
 
+#ifdef BRIDGE_RELAY
     // ---- Bridge relay path ------------------------------------------------
     serialHandler.update();
 
@@ -137,4 +157,5 @@ void loop() {
                   timeSync.isSynced() ? "yes" : "no");
         }
     }
+#endif // BRIDGE_RELAY
 }

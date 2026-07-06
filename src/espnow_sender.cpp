@@ -29,7 +29,25 @@ EspNowSender::EspNowSender()
 bool EspNowSender::init() {
     // Set WiFi to station mode (required for ESP-NOW)
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
     WiFi.disconnect();
+
+    // Radio tuning (mirrors the reference wireless-sender-firmware). Without
+    // this, ESP-NOW broadcasts at the default 1 Mbps long-preamble rate
+    // (~1 ms airtime per small packet → caps small-packet throughput near
+    // ~800-1000/s, which forced a deep in-flight queue and added latency).
+    esp_wifi_set_ps(WIFI_PS_NONE);                 // no modem sleep (latency/jitter)
+    esp_wifi_set_max_tx_power(84);                  // 21 dBm
+    esp_wifi_set_protocol(WIFI_IF_STA,
+                          WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+#if defined(AUDIO_SOURCE) || defined(REPEATER)
+    // Live audio stream: 6 Mbps OFDM. ~150 µs airtime per 49 B packet lifts the
+    // throughput ceiling well above the 1000 pkt/s the 16 kHz/16-frame stream
+    // needs, so a shallow in-flight depth keeps latency low. 6 Mbps also has
+    // ~+14 dB RX sensitivity vs 54 Mbps, so range stays good.
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
+#endif
 
     // Set the WiFi channel. NVS wins over the compile-time default so the
     // channel set from Studio (set_espnow_channel) survives reboot
@@ -66,6 +84,13 @@ bool EspNowSender::init() {
         log_e("Failed to add broadcast peer");
         return false;
     }
+
+#if defined(AUDIO_SOURCE) || defined(REPEATER)
+    // Re-apply the ESP-NOW PHY rate AFTER esp_now_init() — applying it only
+    // before init did not stick (throughput stayed at the 1 Mbps default).
+    esp_err_t rate_err = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
+    log_i("ESP-NOW rate 6M (post-init) rc=%d", (int)rate_err);
+#endif
 
     initialized_ = true;
     log_i("ESP-NOW sender initialized");

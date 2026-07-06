@@ -119,6 +119,9 @@ static void handleLine(const char* line) {
         int lv = doc["level"] | 50;
         if (lv < 0) lv = 0; if (lv > 100) lv = 100;
         Preferences p; p.begin("tx", false); p.putInt("input_level", lv); p.end();
+#ifdef AUDIO_SOURCE
+        audioSourceApplyInputLevel(lv);   // live: drives ES8388 analog PGA on CoreS3
+#endif
         r["status"] = "ok"; r["cmd"] = cmd; r["level"] = lv;
         sendResp(r);
         return;

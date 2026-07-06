@@ -1,5 +1,14 @@
 #include "display.h"
+#ifdef BOARD_CORES3
+// CoreS3 uses M5Unified (the classic M5Stack library does not support it).
+// M5.Display is the M5GFX panel; its drawing API + TFT_*/*_DATUM constants are
+// source-compatible with the classic M5.Lcd, so we alias and reuse the code.
+#include <M5Unified.h>
+#define M5LCD M5.Display
+#else
 #include <M5Stack.h>
+#define M5LCD M5.Lcd
+#endif
 
 // Layout constants
 static constexpr int HEADER_Y      = 0;
@@ -36,18 +45,18 @@ static constexpr uint16_t COL_WARN     = TFT_YELLOW;
 static constexpr uint16_t COL_DIM      = TFT_DARKGREY;
 
 void displayInit() {
-    M5.Lcd.fillScreen(COL_BG);
-    M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+    M5LCD.fillScreen(COL_BG);
+    M5LCD.setTextColor(COL_TEXT, COL_BG);
 
     // Draw header bar
-    M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, COL_HEADER);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(COL_TEXT, COL_HEADER);
-    M5.Lcd.drawString("HAPBEAT TX", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+    M5LCD.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, COL_HEADER);
+    M5LCD.setTextDatum(MC_DATUM);
+    M5LCD.setTextSize(2);
+    M5LCD.setTextColor(COL_TEXT, COL_HEADER);
+    M5LCD.drawString("HAPBEAT TX", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
 
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+    M5LCD.setTextDatum(TL_DATUM);
+    M5LCD.setTextColor(COL_TEXT, COL_BG);
 }
 
 void displayUpdateHeader(bool connected) {
@@ -56,16 +65,16 @@ void displayUpdateHeader(bool connected) {
     s_prev_connected = val;
 
     uint16_t bar_col = connected ? COL_DARKGREEN : COL_HEADER;
-    M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, bar_col);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(COL_TEXT, bar_col);
+    M5LCD.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, bar_col);
+    M5LCD.setTextDatum(MC_DATUM);
+    M5LCD.setTextSize(2);
+    M5LCD.setTextColor(COL_TEXT, bar_col);
 
     const char* label = connected ? "HAPBEAT TX  Connected" : "HAPBEAT TX  Disconnected";
-    M5.Lcd.drawString(label, SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+    M5LCD.drawString(label, SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
 
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+    M5LCD.setTextDatum(TL_DATUM);
+    M5LCD.setTextColor(COL_TEXT, COL_BG);
 }
 
 void displayBootStatus(const char* msg) {
@@ -74,15 +83,15 @@ void displayBootStatus(const char* msg) {
     int y = STATUS_Y + boot_line * 20;
     if (y > 220) {
         // Scroll: clear status area and reset
-        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, REACTION_Y - STATUS_Y, COL_BG);
+        M5LCD.fillRect(0, STATUS_Y, SCREEN_W, REACTION_Y - STATUS_Y, COL_BG);
         boot_line = 0;
         y = STATUS_Y;
     }
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextColor(COL_DIM, COL_BG);
-    M5.Lcd.setCursor(4, y);
-    M5.Lcd.print("> ");
-    M5.Lcd.println(msg);
+    M5LCD.setTextSize(1);
+    M5LCD.setTextColor(COL_DIM, COL_BG);
+    M5LCD.setCursor(4, y);
+    M5LCD.print("> ");
+    M5LCD.println(msg);
     boot_line++;
 }
 
@@ -97,24 +106,24 @@ static void drawField(int x, int y, uint16_t color, const char* text, int field_
     for (int i = len; i < field_chars && i < 31; i++) buf[i] = ' ';
     buf[(field_chars < 31) ? field_chars : 31] = '\0';
 
-    M5.Lcd.setTextColor(color, COL_BG);
-    M5.Lcd.setCursor(x, y);
-    M5.Lcd.print(buf);
+    M5LCD.setTextColor(color, COL_BG);
+    M5LCD.setCursor(x, y);
+    M5LCD.print(buf);
 }
 
 void displayUpdateStatus(uint32_t uptime_sec, uint32_t sent, uint32_t failed,
                          uint8_t wifi_ch, bool time_synced) {
     // Clear reaction area if timeout elapsed
     if (s_reaction_visible && (millis() - s_reaction_shown_at > REACTION_TIMEOUT_MS)) {
-        M5.Lcd.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, COL_BG);
+        M5LCD.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, COL_BG);
         s_reaction_visible = false;
     }
 
-    M5.Lcd.setTextSize(2);
+    M5LCD.setTextSize(2);
 
     // On first draw, clear the status area once
     if (s_status_first) {
-        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, REACTION_Y - STATUS_Y - 2, COL_BG);
+        M5LCD.fillRect(0, STATUS_Y, SCREEN_W, REACTION_Y - STATUS_Y - 2, COL_BG);
         s_status_first = false;
     }
 
@@ -169,35 +178,35 @@ void displaySendReaction(const char* cmd, const char* event_id,
                          uint8_t group, bool success) {
     // Flash the reaction area
     uint16_t bg_col = success ? COL_DARKGREEN : TFT_MAROON;
-    M5.Lcd.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, bg_col);
+    M5LCD.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, bg_col);
 
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.setTextDatum(MC_DATUM);
+    M5LCD.setTextSize(3);
+    M5LCD.setTextDatum(MC_DATUM);
 
     // Command name with result indicator
-    M5.Lcd.setTextColor(success ? COL_OK : COL_FAIL, bg_col);
-    M5.Lcd.drawString(cmd, SCREEN_W / 2, REACTION_Y + 20);
+    M5LCD.setTextColor(success ? COL_OK : COL_FAIL, bg_col);
+    M5LCD.drawString(cmd, SCREEN_W / 2, REACTION_Y + 20);
 
     // Event ID
     if (event_id && event_id[0] != '\0') {
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(COL_TEXT, bg_col);
+        M5LCD.setTextSize(2);
+        M5LCD.setTextColor(COL_TEXT, bg_col);
         // At size 2, ~26 chars fit in 320px
         char buf[27];
         strncpy(buf, event_id, 26);
         buf[26] = '\0';
-        M5.Lcd.drawString(buf, SCREEN_W / 2, REACTION_Y + 55);
+        M5LCD.drawString(buf, SCREEN_W / 2, REACTION_Y + 55);
     }
 
     // Group info
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(COL_DIM, bg_col);
+    M5LCD.setTextSize(2);
+    M5LCD.setTextColor(COL_DIM, bg_col);
     char grp_buf[20];
     snprintf(grp_buf, sizeof(grp_buf), "group: %u", group);
-    M5.Lcd.drawString(grp_buf, SCREEN_W / 2, REACTION_Y + 85);
+    M5LCD.drawString(grp_buf, SCREEN_W / 2, REACTION_Y + 85);
 
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+    M5LCD.setTextDatum(TL_DATUM);
+    M5LCD.setTextColor(COL_TEXT, COL_BG);
 
     s_reaction_shown_at = millis();
     s_reaction_visible = true;
@@ -220,17 +229,17 @@ void displayUpdateAudioStats(uint8_t ch, int level, uint32_t pkt,
                               int inflight, uint32_t drop, uint32_t fail) {
     if (s_as_first) {
         // Clear status area and draw mode header
-        M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x000F);  // dark blue-purple
-        M5.Lcd.setTextDatum(MC_DATUM);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(COL_TEXT, 0x000F);
-        M5.Lcd.drawString("HAPBEAT TX [SOURCE]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
-        M5.Lcd.setTextDatum(TL_DATUM);
-        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
+        M5LCD.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x000F);  // dark blue-purple
+        M5LCD.setTextDatum(MC_DATUM);
+        M5LCD.setTextSize(2);
+        M5LCD.setTextColor(COL_TEXT, 0x000F);
+        M5LCD.drawString("HAPBEAT TX [SOURCE]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+        M5LCD.setTextDatum(TL_DATUM);
+        M5LCD.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
         s_as_first = false;
     }
 
-    M5.Lcd.setTextSize(2);
+    M5LCD.setTextSize(2);
 
     // Line 1: channel + input level
     if (ch != s_as_ch || level != s_as_level) {
@@ -271,17 +280,17 @@ static bool     s_rp_first   = true;
 void displayUpdateRepeaterStats(uint8_t ch, const char* relay_mac,
                                  uint32_t relayed, uint32_t dropped) {
     if (s_rp_first) {
-        M5.Lcd.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x4000);  // dark red
-        M5.Lcd.setTextDatum(MC_DATUM);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(COL_TEXT, 0x4000);
-        M5.Lcd.drawString("HAPBEAT TX [RELAY]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
-        M5.Lcd.setTextDatum(TL_DATUM);
-        M5.Lcd.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
+        M5LCD.fillRect(0, HEADER_Y, SCREEN_W, HEADER_H, 0x4000);  // dark red
+        M5LCD.setTextDatum(MC_DATUM);
+        M5LCD.setTextSize(2);
+        M5LCD.setTextColor(COL_TEXT, 0x4000);
+        M5LCD.drawString("HAPBEAT TX [RELAY]", SCREEN_W / 2, HEADER_Y + HEADER_H / 2);
+        M5LCD.setTextDatum(TL_DATUM);
+        M5LCD.fillRect(0, STATUS_Y, SCREEN_W, 240 - STATUS_Y, COL_BG);
         s_rp_first = false;
     }
 
-    M5.Lcd.setTextSize(2);
+    M5LCD.setTextSize(2);
 
     // Line 1: channel
     if (ch != s_rp_ch) {
@@ -295,9 +304,9 @@ void displayUpdateRepeaterStats(uint8_t ch, const char* relay_mac,
     if (relay_mac && strcmp(relay_mac, s_rp_mac) != 0) {
         strncpy(s_rp_mac, relay_mac, sizeof(s_rp_mac) - 1);
         s_rp_mac[sizeof(s_rp_mac) - 1] = '\0';
-        M5.Lcd.setTextSize(1);  // small text for MAC
+        M5LCD.setTextSize(1);  // small text for MAC
         drawField(4, STATUS_Y + 26, COL_DIM, "SRC:", 4);
-        M5.Lcd.setTextSize(2);
+        M5LCD.setTextSize(2);
         drawField(40, STATUS_Y + 24, COL_TEXT, relay_mac, 17);
     }
 
@@ -312,16 +321,16 @@ void displayUpdateRepeaterStats(uint8_t ch, const char* relay_mac,
 }
 
 void displayError(const char* msg) {
-    M5.Lcd.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, TFT_MAROON);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    M5.Lcd.setTextColor(COL_FAIL, TFT_MAROON);
-    M5.Lcd.drawString("ERROR", SCREEN_W / 2, REACTION_Y + 20);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setTextColor(COL_TEXT, TFT_MAROON);
-    M5.Lcd.drawString(msg, SCREEN_W / 2, REACTION_Y + 50);
-    M5.Lcd.setTextDatum(TL_DATUM);
-    M5.Lcd.setTextColor(COL_TEXT, COL_BG);
+    M5LCD.fillRect(0, REACTION_Y, SCREEN_W, REACTION_H, TFT_MAROON);
+    M5LCD.setTextSize(2);
+    M5LCD.setTextDatum(MC_DATUM);
+    M5LCD.setTextColor(COL_FAIL, TFT_MAROON);
+    M5LCD.drawString("ERROR", SCREEN_W / 2, REACTION_Y + 20);
+    M5LCD.setTextSize(1);
+    M5LCD.setTextColor(COL_TEXT, TFT_MAROON);
+    M5LCD.drawString(msg, SCREEN_W / 2, REACTION_Y + 50);
+    M5LCD.setTextDatum(TL_DATUM);
+    M5LCD.setTextColor(COL_TEXT, COL_BG);
 
     s_reaction_shown_at = millis();
     s_reaction_visible = true;
