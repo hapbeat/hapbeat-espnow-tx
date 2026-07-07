@@ -95,6 +95,11 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
 static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED", "SMOOTH" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
                                                "Opus 15ms", "Opus 28ms" };
+// Audio format per mode (rate + channels). ADPCM carries the full 16 kHz stereo
+// capture; the Opus modes downmix to 8 kHz mono (v3 is haptic-only, so the
+// narrower band + mono is the accepted trade for PLC robustness / low airtime).
+static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
+                                               "8kHz Mono", "8kHz Mono" };
 static const uint16_t STREAM_OPUS_RATE     = 8000;   // Opus encode rate (mono)
 static const int      OPUS_MAX_LEN         = 120;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 80;     // max samples/frame (10 ms @8k)
@@ -680,6 +685,7 @@ static void uiRepaint() {
         d.setTextSize(3); d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
         d.drawString(MODE_NAME[m], 8, 58);
         d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString(MODE_DESC[m], 8, 96);
+        d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.drawString(MODE_FMT[m], 8, 120);
         uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
         uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
     } else if (s_ui == UI_MODE) {
