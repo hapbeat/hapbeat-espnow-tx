@@ -91,7 +91,10 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 1, 40, 1, 16000 },   // 2 M  5 ms
     { 1, 80, 2, 16000 },   // 3 Q 10 ms
 };
-static const char*   MODE_NAME[MODE_COUNT] = { "ADPCM", "L", "M", "Q" };
+// User-facing names (RAW=ADPCM baseline, FAST/BALANCED/SMOOTH=Opus low/mid/robust)
+static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED", "SMOOTH" };
+static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
+                                               "Opus 15ms", "Opus 28ms" };
 static const uint16_t STREAM_OPUS_RATE     = 8000;   // Opus encode rate (mono)
 static const int      OPUS_MAX_LEN         = 120;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 80;     // max samples/frame (10 ms @8k)
@@ -641,37 +644,110 @@ void audioSourceSetup() {
 }
 
 #ifdef BOARD_CORES3
-// On-screen diagnostic (CoreS3 LCD): buffer depth + estimated TX-side latency,
-// send rate, drop count, and L/R peak. fillScreen once then opaque fixed-width
-// overwrites (no flicker).
-static void displayCoreS3Diag() {
+// ---- Hierarchical touch UI: HOME → MODE selector / CHANNEL selector --------
+// HOME shows the current mode + channel + live stats and two buttons. Tapping a
+// button drills into a full-screen selector; tapping the header returns. Mode /
+// channel changes reboot into the new setting (see audioSourceSetMode).
+enum { UI_HOME = 0, UI_MODE = 1, UI_CH = 2 };
+static uint8_t s_ui      = UI_HOME;
+static bool    s_uiDirty = true;              // force a full repaint on screen change
+static const uint16_t UI_SEL_BG = 0x0208;     // dark-cyan fill behind a selected item
+
+static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16_t tx, bool sel) {
+    auto& d = M5.Display;
+    if (sel) d.fillRoundRect(x, y, w, h, 8, UI_SEL_BG);
+    d.drawRoundRect(x, y, w, h, 8, sel ? TFT_CYAN : bd);
+    d.setTextSize(2);
+    d.setTextColor(tx, sel ? UI_SEL_BG : TFT_BLACK);
+    d.setTextDatum(textdatum_t::middle_center);
+    d.drawString(s, x + w / 2, y + h / 2);
+    d.setTextDatum(textdatum_t::top_left);
+}
+
+// Repaint the whole current screen (static parts).
+static void uiRepaint() {
+    auto& d = M5.Display;
+    d.fillScreen(TFT_BLACK);
+    uint8_t m = s_mode < MODE_COUNT ? s_mode : 0;
+    if (s_ui == UI_HOME) {
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left);  d.drawString("HAPBEAT SRC", 6, 6);
+        char hd[16]; snprintf(hd, sizeof(hd), "ch%u", s_channel);
+        d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_right);  d.drawString(hd, 314, 6);
+        d.setTextDatum(textdatum_t::top_left);
+        d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString("MODE", 8, 44);
+        d.setTextSize(3); d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
+        d.drawString(MODE_NAME[m], 8, 58);
+        d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString(MODE_DESC[m], 8, 96);
+        uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
+        uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
+    } else if (s_ui == UI_MODE) {
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT MODE", 6, 6);
+        for (int i = 0; i < MODE_COUNT; i++) {
+            int y = 42 + i * 47; bool cur = (i == m);
+            if (cur) d.fillRoundRect(6, y, 308, 42, 6, UI_SEL_BG);
+            d.drawRoundRect(6, y, 308, 42, 6, cur ? TFT_CYAN : TFT_DARKGREY);
+            d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, cur ? UI_SEL_BG : TFT_BLACK);
+            d.setTextDatum(textdatum_t::middle_left);  d.drawString(MODE_NAME[i], 16, y + 21);
+            d.setTextColor(TFT_DARKGREY, cur ? UI_SEL_BG : TFT_BLACK);
+            d.setTextDatum(textdatum_t::middle_right); d.drawString(MODE_DESC[i], 302, y + 21);
+        }
+        d.setTextDatum(textdatum_t::top_left);
+    } else {  // UI_CH
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT CHANNEL", 6, 6);
+        d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.drawString("avoid 2.4GHz interference", 8, 40);
+        const uint8_t chs[3] = {1, 6, 11};
+        for (int i = 0; i < 3; i++) {
+            char lbl[8]; snprintf(lbl, sizeof(lbl), "CH%u", chs[i]);
+            uiBtn(12 + i * 102, 90, 92, 62, lbl, TFT_DARKCYAN, TFT_CYAN, chs[i] == s_channel);
+        }
+        d.setTextSize(1); d.setTextColor(TFT_YELLOW, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("applies on select (reboot)", 8, 172);
+    }
+    s_uiDirty = false;
+}
+
+// HOME live stats (pkt/s + drop) — opaque overwrite, no full repaint.
+static void uiUpdateHome() {
+    if (s_ui != UI_HOME) return;
     static uint32_t last = 0, lastPkt = 0;
-    static bool first = true;
     uint32_t now = millis();
     if (now - last < 400) return;
     uint32_t dt = now - last; last = now;
     uint32_t pps = dt ? (uint32_t)((uint64_t)(s_txPktSent - lastPkt) * 1000 / dt) : 0;
     lastPkt = s_txPktSent;
-
-    const int capMs  = (int)((3 * 32 * 1000) / CAPTURE_RATE);        // DMA capture ~2 ms
-    const int pktMs  = (int)((FRAMES_PKT * 1000) / STREAM_RATE);     // 1 ms / packet
-    const int estLat = capMs + pktMs + STREAM_MAX_INFLIGHT * pktMs;  // worst-case TX-side
-
     auto& d = M5.Display;
-    if (first) { d.fillScreen(TFT_BLACK); d.setTextSize(2); first = false; }
-    d.setTextColor(TFT_CYAN, TFT_BLACK);
-    d.setCursor(4, 4);    d.printf("MODE:%-5s CH:%-2u ",
-                                   MODE_NAME[s_mode < MODE_COUNT ? s_mode : 0], s_channel);
-    d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
-    d.setCursor(4, 30);   d.printf("buf(infl)=%-3d ", STREAM_MAX_INFLIGHT);
-    d.setTextColor(TFT_WHITE, TFT_BLACK);
-    d.setCursor(4, 56);   d.printf("estTX ~%-3dms ", estLat);
-    d.setCursor(4, 82);   d.printf("pkt/s %-4lu ", (unsigned long)pps);
+    d.setTextSize(2); d.setTextDatum(textdatum_t::top_left);
     d.setTextColor(s_txDroppedBusy ? TFT_YELLOW : TFT_GREEN, TFT_BLACK);
-    d.setCursor(4, 108);  d.printf("drop %-7lu ", (unsigned long)s_txDroppedBusy);
-    d.setTextColor(TFT_WHITE, TFT_BLACK);
-    d.setCursor(4, 134);  d.printf("Lpk%-6d ", (int)s_lmax);
-    d.setCursor(4, 160);  d.printf("Rpk%-6d ", (int)s_rmax);
+    char st[32]; snprintf(st, sizeof(st), "%lu pkt/s drop %lu    ",
+                          (unsigned long)pps, (unsigned long)s_txDroppedBusy);
+    d.drawString(st, 8, 210);
+}
+
+// Dispatch one touch-release at (x,y) based on the current screen.
+static void uiTouch(int x, int y) {
+    if (s_ui == UI_HOME) {
+        if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_MODE : UI_CH; s_uiDirty = true; }
+    } else if (s_ui == UI_MODE) {
+        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back
+        int i = (y - 42) / 47;
+        if (i >= 0 && i < MODE_COUNT) audioSourceSetMode(i);        // saves NVS + reboots
+    } else {  // UI_CH
+        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
+        if (y >= 90 && y <= 152) {
+            const uint8_t chs[3] = {1, 6, 11};
+            int i = (x - 12) / 102;
+            if (i >= 0 && i < 3 && chs[i] != s_channel) {
+                Preferences p; p.begin("espnow", false); p.putUChar("channel", chs[i]); p.end();
+                Serial.printf("[AUDIO-SRC] channel -> %u, rebooting\n", chs[i]);
+                delay(150); ESP.restart();
+            }
+        }
+    }
 }
 #endif
 
@@ -680,26 +756,15 @@ void audioSourceLoop() {
     heartbeatTick();
 
 #ifdef BOARD_CORES3
-    // Touch UI: tap the TOP half of the LCD to cycle stream mode (0→L→M→Q→0),
-    // the BOTTOM half to cycle channel (1→6→11). Capture/encode/send run in
-    // audioRxTask; here we only refresh the LCD + service touch.
+    // Hierarchical touch UI (HOME → MODE / CHANNEL). Capture/encode/send run in
+    // audioRxTask; here we only service touch + refresh the LCD.
     M5.update();
     if (M5.Touch.getCount() > 0) {
         auto t = M5.Touch.getDetail(0);
-        if (t.wasReleased()) {
-            if (t.y < 120) {
-                audioSourceSetMode((audioSourceGetMode() + 1) % MODE_COUNT);
-            } else {
-                // cycle channel 1→6→11 (persist + live apply; peer re-add on reboot)
-                uint8_t nc = (s_channel == 1) ? 6 : (s_channel == 6) ? 11 : 1;
-                s_channel = nc;
-                Preferences p; p.begin("espnow", false); p.putUChar("channel", nc); p.end();
-                esp_wifi_set_channel(nc, WIFI_SECOND_CHAN_NONE);
-                Serial.printf("[AUDIO-SRC] channel -> %u (reboot to re-add peer)\n", nc);
-            }
-        }
+        if (t.wasReleased()) uiTouch(t.x, t.y);
     }
-    displayCoreS3Diag();
+    if (s_uiDirty) uiRepaint();
+    uiUpdateHome();
     delay(20);
 #else
     static int16_t cap[CAP_FRAMES * 2];   // interleaved L,R @ 48 kHz
