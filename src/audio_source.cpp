@@ -77,32 +77,52 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 // ---- Streaming modes (mode_id = 0xAA packet header byte [1]) ----------------
 // The sender picks the mode; the receiver reads mode_id and auto-adapts its
 // decode + jitter-buffer depth. Table MUST match device-firmware
-// espnow_stream.cpp MODE_DEFS. See docs/instructions-espnow-modes-button-ui-*.
-//   0 = ADPCM 16k stereo 64-frame(4ms)  pb1   compat / floor (classic + CoreS3)
-//   1 = OPUS  8k mono     40-smp(5ms)    pb1   L  low-latency
-//   2 = OPUS  8k mono     40-smp(5ms)    pb1   M  middle
-//   3 = OPUS  8k mono     80-smp(10ms)   pb2   Q  quality
-enum StreamMode : uint8_t { MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3, MODE_COUNT = 4 };
-struct ModeDef { uint8_t codec; uint16_t opus_frame; uint8_t piggyback; uint16_t bitrate; };
-// codec: 0 = ADPCM, 1 = OPUS. opus_frame = samples/frame at STREAM_OPUS_RATE.
-static const ModeDef MODE_DEFS[MODE_COUNT] = {
-    { 0,  0, 1,     0 },   // 0 ADPCM
-    { 1, 40, 1, 16000 },   // 1 L  5 ms
-    { 1, 40, 1, 16000 },   // 2 M  5 ms
-    { 1, 80, 2, 16000 },   // 3 Q 10 ms
+// espnow_stream.cpp RX_MODE. See docs/instructions-espnow-modes-button-ui-*.
+//   0 RAW      ADPCM 16k stereo 64-frame(4ms)  pb1  compat/floor (classic+CoreS3)
+//   1 FAST     OPUS   8k mono    40-smp(5ms)    pb1  low-latency
+//   2 BALANCED OPUS   8k mono    40-smp(5ms)    pb1  middle (deeper RX buffer)
+//   3 SMOOTH   OPUS   8k mono    80-smp(10ms)   pb2  robust (deepest + 2× pb)
+//   4 STEREO   OPUS   8k stereo  80-smp(10ms)   pb1  dual-channel haptics, 8 kHz
+//   5 HIFI     OPUS  16k stereo 160-smp(10ms)   pb2  dual-channel, full 16 kHz band
+// Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only).
+enum StreamMode : uint8_t {
+    MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3,
+    MODE_STEREO = 4, MODE_HIFI = 5, MODE_COUNT = 6
 };
-// User-facing names (RAW=ADPCM baseline, FAST/BALANCED/SMOOTH=Opus low/mid/robust)
-static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED", "SMOOTH" };
+struct ModeDef {
+    uint8_t  codec;       // 0 = ADPCM, 1 = OPUS
+    uint16_t rate;        // capture/encode rate (Hz): 8000 or 16000
+    uint8_t  channels;    // 1 = mono, 2 = stereo
+    uint16_t opus_frame;  // samples PER CHANNEL per Opus frame (at `rate`)
+    uint8_t  piggyback;   // redundant prior frames per packet
+    uint16_t bitrate;     // Opus target bitrate (bps)
+};
+static const ModeDef MODE_DEFS[MODE_COUNT] = {
+    { 0, 16000, 2,   0, 1,     0 },   // 0 RAW      ADPCM 16k stereo
+    { 1,  8000, 1,  40, 1, 16000 },   // 1 FAST     Opus  8k mono    5 ms
+    { 1,  8000, 1,  40, 1, 16000 },   // 2 BALANCED Opus  8k mono    5 ms
+    { 1,  8000, 1,  80, 2, 16000 },   // 3 SMOOTH   Opus  8k mono   10 ms
+    { 1,  8000, 2,  80, 1, 24000 },   // 4 STEREO   Opus  8k stereo 10 ms
+    { 1, 16000, 2, 160, 2, 40000 },   // 5 HIFI     Opus 16k stereo 10 ms
+};
+// User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
+// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz).
+static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED",
+                                               "SMOOTH", "STEREO", "HIFI" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
-                                               "Opus 15ms", "Opus 28ms" };
-// Audio format per mode (rate + channels). ADPCM carries the full 16 kHz stereo
-// capture; the Opus modes downmix to 8 kHz mono (v3 is haptic-only, so the
-// narrower band + mono is the accepted trade for PLC robustness / low airtime).
+                                               "Opus 15ms", "Opus 28ms",
+                                               "Opus 18ms", "Opus 28ms" };
+// Audio format per mode (rate + channels), shown on the sender HOME screen.
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
-                                               "8kHz Mono", "8kHz Mono" };
-static const uint16_t STREAM_OPUS_RATE     = 8000;   // Opus encode rate (mono)
+                                               "8kHz Mono", "8kHz Mono",
+                                               "8kHz Stereo", "16kHz Stereo" };
 static const int      OPUS_MAX_LEN         = 120;    // max opus frame bytes (headroom)
-static const int      OPUS_MAX_SMP         = 80;     // max samples/frame (10 ms @8k)
+static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
+// s_opusAccum is [OPUS_MAX_SMP*2] (per-channel × up to 2 ch). Guard that the
+// largest Opus frame in MODE_DEFS (HIFI = 160 samples/ch) still fits — if a
+// future mode raises opus_frame, bump OPUS_MAX_SMP or this fails to build
+// instead of silently overflowing the encoder input.
+static_assert(OPUS_MAX_SMP >= 160, "OPUS_MAX_SMP must hold the largest MODE_DEFS opus_frame");
 
 // Live-selectable current mode (NVS "tx"/"mode", default 0 = ADPCM known-good).
 static volatile uint8_t s_mode = MODE_ADPCM;
@@ -398,10 +418,12 @@ static es_mic_gain_t pgaFromLevel(int lvl) {
 extern "C" char* global_stack;
 static OpusEncoder* s_enc      = nullptr;
 static uint8_t      s_enc_mode = 0xFF;          // mode s_enc is configured for
-static int16_t      s_opusAccum[OPUS_MAX_SMP];  // 8 kHz mono frame accumulator
-static int          s_opusAccumN = 0;
+static int16_t      s_opusAccum[OPUS_MAX_SMP * 2];  // frame accumulator (×2 = stereo)
+static int          s_opusAccumN = 0;               // count of int16 written (interleaved)
 static int          s_decim2     = 0;           // 16k→8k 2:1 decimation phase
-static int32_t      s_decim2prev = 0;           // 2-tap average state
+static int32_t      s_decim2prev = 0;           // 2-tap average state (mono)
+static int32_t      s_decLprev   = 0;           // 2-tap average state (stereo L)
+static int32_t      s_decRprev   = 0;           // 2-tap average state (stereo R)
 // Opus frame history for piggyback (hist[0]=most recent prev, hist[1]=older).
 static uint8_t      s_opHist[2][OPUS_MAX_LEN];
 static uint8_t      s_opHistLen[2] = {0, 0};
@@ -412,39 +434,47 @@ static int          s_opHistN      = 0;         // valid history entries (0..2)
 // INTERNAL SRAM (PSRAM wait states would ~2× the encode time — see gate①).
 static void opusEncoderConfig(uint8_t mode) {
     if (mode < MODE_L || mode >= MODE_COUNT) return;
-    // Pre-seed libopus's global scratch (see extern above) — internal SRAM for
-    // fast encode, PSRAM fallback if no 64 KB contiguous internal block remains.
+    // Pre-seed libopus's NONTHREADSAFE_PSEUDOSTACK scratch (see extern above).
+    // pschatzmann's ALLOC_STACK keeps a non-NULL global_stack as-is, so THIS
+    // buffer's size — not the library's GLOBAL_STACK_SIZE (60000) — is the real
+    // ceiling. 8 kHz mono needed <64 KB; 16 kHz stereo (HIFI) uses more CELT
+    // scratch, so seed 96 KB internal (SRAM for fast encode; ~200 KB largest
+    // free block available) with a PSRAM fallback. An overflow here would be a
+    // silent heap corruption, so err toward headroom.
     if (!global_stack) {
-        global_stack = (char*)heap_caps_malloc(64 * 1024,
+        global_stack = (char*)heap_caps_malloc(96 * 1024,
                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!global_stack)
-            global_stack = (char*)heap_caps_malloc(128 * 1024, MALLOC_CAP_SPIRAM);
+            global_stack = (char*)heap_caps_malloc(160 * 1024, MALLOC_CAP_SPIRAM);
         Serial.printf("[AUDIO-SRC] opus scratch @ %p (largest internal free %u)\n",
                       (void*)global_stack,
                       (unsigned)heap_caps_get_largest_free_block(
                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
+    uint16_t rate = MODE_DEFS[mode].rate;
+    uint8_t  ch   = MODE_DEFS[mode].channels;
     if (!s_enc) {
-        // Create ONCE; reused for all Opus modes. Opus takes the frame size as a
-        // per-encode-call argument, so L/M/Q (40/40/80 samples, same bitrate)
-        // share one encoder — no per-switch reconfigure. (A RESET_STATE + re-ctl
-        // on the live switch was crashing the encoder mid-stream.)
-        int sz = opus_encoder_get_size(1);
+        // Created ONCE per boot, sized + init'd for THIS mode's rate/channels.
+        // Safe as init-once because every mode change reboots (audioSourceSetMode
+        // → ESP.restart), so the encoder is always fresh for the persisted mode.
+        // (A live RESET_STATE + re-ctl mid-stream was crashing the encoder, and
+        // rate/channel changes need a differently-sized encoder anyway.)
+        int sz = opus_encoder_get_size(ch);
         s_enc = (OpusEncoder*)heap_caps_malloc((size_t)sz,
                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
-        opus_encoder_init(s_enc, STREAM_OPUS_RATE, 1, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
+        opus_encoder_init(s_enc, rate, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
         opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
         opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));
         opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
     }
-    s_enc_mode   = mode;   // switches opusPush8k's frame size to this mode
+    s_enc_mode   = mode;   // switches opusPushSample's frame size / channels
     s_opusAccumN = 0;      // drop the partial frame from the old size
     s_opHistN    = 0;      // old-size piggyback frames are invalid now
     s_decim2     = 0;
-    Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz mono, %u smp, %u bps)\n",
-                  MODE_NAME[mode], STREAM_OPUS_RATE, MODE_DEFS[mode].opus_frame,
-                  MODE_DEFS[mode].bitrate);
+    Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz %s, %u smp/ch, %u bps)\n",
+                  MODE_NAME[mode], rate, ch == 2 ? "stereo" : "mono",
+                  MODE_DEFS[mode].opus_frame, MODE_DEFS[mode].bitrate);
 }
 
 // Assemble + broadcast one Opus 0xAA packet (mode 1-3) with piggyback.
@@ -486,12 +516,15 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
     s_seq++;
 }
 
-// Accumulate one 8 kHz mono sample; encode + send when a full frame is ready.
-static inline void opusPush8k(int16_t s) {
+// Accumulate one sample (mono: use `l`, r ignored; stereo: interleave l,r at the
+// mode's rate). Encode + send when a full per-channel frame is ready.
+static inline void opusPushSample(int16_t l, int16_t r) {
     if (!s_enc || s_enc_mode < MODE_L) return;
-    s_opusAccum[s_opusAccumN++] = s;
-    int need = MODE_DEFS[s_enc_mode].opus_frame;
-    if (s_opusAccumN >= need) {
+    uint8_t ch = MODE_DEFS[s_enc_mode].channels;
+    s_opusAccum[s_opusAccumN++] = l;
+    if (ch == 2) s_opusAccum[s_opusAccumN++] = r;
+    int need = MODE_DEFS[s_enc_mode].opus_frame;   // samples PER CHANNEL
+    if (s_opusAccumN >= need * ch) {
         uint8_t buf[OPUS_MAX_LEN];
         int n = opus_encode(s_enc, s_opusAccum, need, buf, sizeof(buf));
         s_opusAccumN = 0;
@@ -542,11 +575,23 @@ static void audioRxTask(void* /*arg*/) {
                     accum[accumIdx * 2]     = (int16_t)l;
                     accum[accumIdx * 2 + 1] = (int16_t)r;
                     if (++accumIdx >= FRAMES_PKT) { streamEncodeAndSend(accum); accumIdx = 0; }
+                } else if (MODE_DEFS[mode].rate >= 16000) {
+                    // 16 kHz Opus: no decimation. Stereo keeps L/R; mono downmixes.
+                    if (MODE_DEFS[mode].channels == 2)
+                        opusPushSample((int16_t)l, (int16_t)r);
+                    else
+                        opusPushSample((int16_t)(((int32_t)l + r) / 2), 0);
+                } else if (MODE_DEFS[mode].channels == 2) {
+                    // 8 kHz stereo Opus: 2:1 decimate L and R separately (2-tap avg).
+                    if (s_decim2 == 0) { s_decLprev = l; s_decRprev = r; s_decim2 = 1; }
+                    else { s_decim2 = 0;
+                           opusPushSample((int16_t)((s_decLprev + l) / 2),
+                                          (int16_t)((s_decRprev + r) / 2)); }
                 } else {
-                    // downmix + 2:1 decimate 16k stereo → 8k mono (2-tap average).
+                    // 8 kHz mono Opus: downmix + 2:1 decimate 16k stereo → 8k mono.
                     int32_t mono16 = ((int32_t)l + r) / 2;
                     if (s_decim2 == 0) { s_decim2prev = mono16; s_decim2 = 1; }
-                    else { s_decim2 = 0; opusPush8k((int16_t)((s_decim2prev + mono16) / 2)); }
+                    else { s_decim2 = 0; opusPushSample((int16_t)((s_decim2prev + mono16) / 2), 0); }
                 }
             }
         }
@@ -669,6 +714,11 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
     d.setTextDatum(textdatum_t::top_left);
 }
 
+// MODE-select list geometry — 6 rows must fit the 240 px height (box 30, pitch
+// 33 from y0=38 → last row ends at 233). Shared by render + touch hit-test.
+static const int UI_MODE_RY0 = 38;
+static const int UI_MODE_RH  = 33;
+
 // Repaint the whole current screen (static parts).
 static void uiRepaint() {
     auto& d = M5.Display;
@@ -692,13 +742,13 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT MODE", 6, 6);
         for (int i = 0; i < MODE_COUNT; i++) {
-            int y = 42 + i * 47; bool cur = (i == m);
-            if (cur) d.fillRoundRect(6, y, 308, 42, 6, UI_SEL_BG);
-            d.drawRoundRect(6, y, 308, 42, 6, cur ? TFT_CYAN : TFT_DARKGREY);
+            int y = UI_MODE_RY0 + i * UI_MODE_RH; bool cur = (i == m);
+            if (cur) d.fillRoundRect(6, y, 308, 30, 6, UI_SEL_BG);
+            d.drawRoundRect(6, y, 308, 30, 6, cur ? TFT_CYAN : TFT_DARKGREY);
             d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, cur ? UI_SEL_BG : TFT_BLACK);
-            d.setTextDatum(textdatum_t::middle_left);  d.drawString(MODE_NAME[i], 16, y + 21);
+            d.setTextDatum(textdatum_t::middle_left);  d.drawString(MODE_NAME[i], 16, y + 15);
             d.setTextColor(TFT_DARKGREY, cur ? UI_SEL_BG : TFT_BLACK);
-            d.setTextDatum(textdatum_t::middle_right); d.drawString(MODE_DESC[i], 302, y + 21);
+            d.setTextDatum(textdatum_t::middle_right); d.drawString(MODE_DESC[i], 302, y + 15);
         }
         d.setTextDatum(textdatum_t::top_left);
     } else {  // UI_CH
@@ -740,7 +790,7 @@ static void uiTouch(int x, int y) {
         if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_MODE : UI_CH; s_uiDirty = true; }
     } else if (s_ui == UI_MODE) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back
-        int i = (y - 42) / 47;
+        int i = (y - UI_MODE_RY0) / UI_MODE_RH;
         if (i >= 0 && i < MODE_COUNT) audioSourceSetMode(i);        // saves NVS + reboots
     } else {  // UI_CH
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
@@ -814,10 +864,10 @@ void audioSourceApplyInputLevel(int level) {
 #endif
 }
 
-// Live stream-mode select (0=ADPCM, 1=L, 2=M, 3=Q). Persisted to NVS. On the
-// classic (non-CoreS3) sender only ADPCM (0) is available; Opus modes are
-// accepted but the classic loop still emits ADPCM (no encoder). The CoreS3
-// capture task reconfigures the Opus encoder on the next block.
+// Live stream-mode select (0=RAW/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
+// 4=STEREO, 5=HIFI). Persisted to NVS, then reboots into the mode (a clean boot
+// per mode is proven stable; a live re-init crashed the encoder). On the classic
+// (non-CoreS3) sender only ADPCM (0) is available — Opus needs the CoreS3.
 void audioSourceSetMode(int mode) {
     if (mode < 0 || mode >= MODE_COUNT) return;
 #ifndef BOARD_CORES3
