@@ -9,8 +9,9 @@
 // audioStreamSender, which is the latency-optimized origin):
 //   * Capture runs in a dedicated, core-pinned FreeRTOS task (not the Arduino
 //     loop) so scheduling jitter doesn't perturb timing.
-//   * Raw driver/i2s.h with SMALL DMA buffers (3 x 32) read in tiny chunks,
-//     to minimise capture/DMA latency (large buffers add ~10 ms).
+//   * Raw driver/i2s.h read in tiny 64-frame chunks (low read-granularity
+//     latency) but backed by a deep DMA ring (16 x 32 frames ~= 10.67 ms) so a
+//     multi-ms Opus encode stall can't overflow RX DMA and drop samples.
 //   * Capture at 48 kHz and software-decimate 3:1 to 16 kHz — the ES8388's
 //     higher-rate decimation filter has lower group delay than at 16 kHz.
 //   * Line input = LINPUT1/RINPUT1 (the TRS line-in jack). LINPUT2 is the mic
@@ -42,6 +43,9 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include <driver/i2s.h>
+#include <esp_timer.h>            // esp_timer_get_time() for encode-time telemetry
+#include <esp_system.h>           // esp_reset_reason() + esp_get_free_heap_size()
+#include <freertos/queue.h>       // I2S event queue (RX overflow telemetry)
 #include <cstring>
 
 #ifdef BOARD_CORES3
@@ -95,15 +99,16 @@ struct ModeDef {
     uint8_t  channels;    // 1 = mono, 2 = stereo
     uint16_t opus_frame;  // samples PER CHANNEL per Opus frame (at `rate`)
     uint8_t  piggyback;   // redundant prior frames per packet
-    uint16_t bitrate;     // Opus target bitrate (bps)
+    uint16_t bitrate;     // Opus target bitrate (bps; uint16 → keep ≤65535)
+    uint8_t  complexity;  // Opus complexity 0-10 (postfilter/tf gates at ≥2/≥5)
 };
 static const ModeDef MODE_DEFS[MODE_COUNT] = {
-    { 0, 16000, 2,   0, 1,     0 },   // 0 RAW      ADPCM 16k stereo
-    { 1,  8000, 1,  40, 1, 16000 },   // 1 FAST     Opus  8k mono    5 ms
-    { 1,  8000, 1,  40, 1, 16000 },   // 2 BALANCED Opus  8k mono    5 ms
-    { 1,  8000, 1,  80, 2, 16000 },   // 3 SMOOTH   Opus  8k mono   10 ms
-    { 1,  8000, 2,  80, 1, 24000 },   // 4 STEREO   Opus  8k stereo 10 ms
-    { 1, 16000, 2, 160, 2, 40000 },   // 5 HIFI     Opus 16k stereo 10 ms
+    { 0, 16000, 2,   0, 1,     0, 0 },   // 0 RAW      ADPCM 16k stereo
+    { 1,  8000, 1,  40, 1, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms
+    { 1,  8000, 1,  40, 1, 48000, 2 },   // 2 BALANCED Opus  8k mono    5 ms
+    { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms
+    { 1,  8000, 2,  80, 1, 64000, 2 },   // 4 STEREO   Opus  8k stereo 10 ms
+    { 1, 16000, 2, 160, 2, 60000, 0 },   // 5 HIFI     Opus 16k stereo 10 ms
 };
 // User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
 // ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz).
@@ -116,7 +121,7 @@ static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
                                                "8kHz Mono", "8kHz Mono",
                                                "8kHz Stereo", "16kHz Stereo" };
-static const int      OPUS_MAX_LEN         = 120;    // max opus frame bytes (headroom)
+static const int      OPUS_MAX_LEN         = 160;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
 // s_opusAccum is [OPUS_MAX_SMP*2] (per-channel × up to 2 ch). Guard that the
 // largest Opus frame in MODE_DEFS (HIFI = 160 samples/ch) still fits — if a
@@ -166,6 +171,13 @@ static volatile int      s_inflight      = 0;
 static volatile uint32_t s_txSendFail    = 0;
 static          uint32_t s_txDroppedBusy = 0;
 static          uint32_t s_txPktSent     = 0;
+
+// ---- P0 telemetry: Opus encode time + I2S RX overflow (see quality-fix instr) --
+static volatile uint64_t s_encUsSum = 0;   // sum of per-frame opus_encode() µs
+static volatile uint32_t s_encUsMax = 0;   // worst per-frame opus_encode() µs
+static volatile uint32_t s_encCnt   = 0;   // frames encoded this heartbeat window
+static QueueHandle_t     s_i2sEvtQ  = nullptr;  // I2S_NUM_0 driver event queue
+static volatile uint32_t s_i2sOvf   = 0;   // cumulative RX_Q_OVF + DMA_ERROR events
 
 // ---- raw-input signal stats (raw L & R, pre-decimation) for the heartbeat --
 static          int32_t  s_lmin = 32767, s_lmax = -32768;
@@ -279,15 +291,21 @@ static void heartbeatTick() {
     s_last_hb = now;
     long lmean = s_scnt ? (long)(s_lsum / (int64_t)s_scnt) : 0;
     long rmean = s_scnt ? (long)(s_rsum / (int64_t)s_scnt) : 0;
+    uint32_t enc_avg = s_encCnt ? (uint32_t)(s_encUsSum / s_encCnt) : 0;
     Serial.printf("[AUDIO-SRC] hb codec=%d pkt=%u capfail=%u drop=%u fail=%u "
+                  "enc=%u/%uus ovf=%u heap=%u/%u inflight=%d "
                   "L[%ld..%ld m%ld] R[%ld..%ld m%ld]\n",
                   s_codecOk ? 1 : 0,
                   s_txPktSent, s_capFail, s_txDroppedBusy, (uint32_t)s_txSendFail,
+                  enc_avg, (uint32_t)s_encUsMax, (uint32_t)s_i2sOvf,
+                  (unsigned)esp_get_free_heap_size(),
+                  (unsigned)esp_get_minimum_free_heap_size(), s_inflight,
                   (long)s_lmin, (long)s_lmax, lmean,
                   (long)s_rmin, (long)s_rmax, rmean);
     s_lmin = 32767; s_lmax = -32768; s_lsum = 0;
     s_rmin = 32767; s_rmax = -32768; s_rsum = 0;
     s_scnt = 0;
+    s_encUsSum = 0; s_encUsMax = 0; s_encCnt = 0;
 }
 
 #ifndef BOARD_CORES3
@@ -332,8 +350,8 @@ static void i2sRxInit(int mck, int bck, int ws, int din) {
     cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count        = 3;    // small buffers → low capture latency
-    cfg.dma_buf_len          = 32;   // tiny read chunk (~0.67 ms @ 48 kHz)
+    cfg.dma_buf_count        = 16;   // deep DMA (16×32/48000 = 10.67 ms) rides out encode stalls
+    cfg.dma_buf_len          = 32;   // 0.67 ms read chunk @ 48 kHz (16 bufs = 10.67 ms total)
 #ifdef BOARD_CORES3
     // ESP32-S3: APLL-derived MCLK can fail to clock the ES8388 (DIN reads 0).
     // The M5Module-Audio driver uses the non-APLL path on S3 and clocks fine.
@@ -357,10 +375,26 @@ static void i2sRxInit(int mck, int bck, int ws, int din) {
     pins.data_out_num = I2S_PIN_NO_CHANGE;
     pins.data_in_num  = din;
 
-    i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
+    // Install WITH an event queue (depth 32) so RX overflow (RX_Q_OVF) and DMA
+    // errors become observable — otherwise silent DMA drops look like clean audio.
+    i2s_driver_install(I2S_NUM_0, &cfg, 32, &s_i2sEvtQ);
     i2s_set_pin(I2S_NUM_0, &pins);
     i2s_set_clk(I2S_NUM_0, CAPTURE_RATE, I2S_BITS_PER_SAMPLE_16BIT,
                 I2S_CHANNEL_STEREO);
+}
+
+// Drain the I2S event queue NON-BLOCKING and tally overflow/DMA-error events.
+// MUST be called every capture iteration: at len=32 the driver posts ~1500
+// RX_DONE events/s, so a per-heartbeat drain would let the queue fill and lose
+// the very overflow events we are counting. Shared by the CoreS3 task and the
+// classic loop.
+static inline void drainI2sEvents() {
+    if (!s_i2sEvtQ) return;
+    i2s_event_t ev;
+    while (xQueueReceive(s_i2sEvtQ, &ev, 0) == pdTRUE) {
+        if (ev.type == I2S_EVENT_RX_Q_OVF || ev.type == I2S_EVENT_DMA_ERROR)
+            s_i2sOvf++;
+    }
 }
 
 #ifdef BOARD_CORES3
@@ -465,7 +499,7 @@ static void opusEncoderConfig(uint8_t mode) {
         if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
         opus_encoder_init(s_enc, rate, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
         opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
-        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));
+        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(MODE_DEFS[mode].complexity));
         opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
     }
     s_enc_mode   = mode;   // switches opusPushSample's frame size / channels
@@ -501,10 +535,18 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
             pkt[p++] = s_opHistLen[h];
             memcpy(pkt + p, s_opHist[h], s_opHistLen[h]); p += s_opHistLen[h];
         }
-        s_inflight++;
-        esp_err_t e = esp_now_send(BROADCAST_MAC, pkt, p);
-        if (e != ESP_OK) { s_inflight--; s_txSendFail++; }
-        else s_txPktSent++;
+        // ESP-NOW hard limit is 250 B (ESP_NOW_MAX_DATA_LEN). A bitrate/piggyback
+        // combo that overflows would fail the send anyway — skip + warn so it's
+        // visible in the log instead of a silent stream stall.
+        if (p > 250) {
+            Serial.printf("[AUDIO-SRC] opus packet %u B > 250, skipping (mode=%u)\n",
+                          (unsigned)p, mode);
+        } else {
+            s_inflight++;
+            esp_err_t e = esp_now_send(BROADCAST_MAC, pkt, p);
+            if (e != ESP_OK) { s_inflight--; s_txSendFail++; }
+            else s_txPktSent++;
+        }
     }
     // Record current frame into history (shift) + advance seq — done even on a
     // busy-drop so the NEXT packet's piggyback can still recover this frame.
@@ -526,7 +568,12 @@ static inline void opusPushSample(int16_t l, int16_t r) {
     int need = MODE_DEFS[s_enc_mode].opus_frame;   // samples PER CHANNEL
     if (s_opusAccumN >= need * ch) {
         uint8_t buf[OPUS_MAX_LEN];
+        int64_t t0 = esp_timer_get_time();
         int n = opus_encode(s_enc, s_opusAccum, need, buf, sizeof(buf));
+        uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+        s_encUsSum += dt;
+        if (dt > s_encUsMax) s_encUsMax = dt;
+        s_encCnt++;
         s_opusAccumN = 0;
         if (n > 0) sendOpusPacket(buf, n);
     }
@@ -538,8 +585,9 @@ static void audioRxTask(void* /*arg*/) {
     int accumIdx = 0;
     uint32_t dcount = 0;
     uint8_t taskMode = 0xFF;                 // detect live mode switches
-    static int16_t rx[FRAMES_PKT * 2];      // tiny read chunk (16 stereo frames)
+    static int16_t rx[FRAMES_PKT * 2];      // read chunk (64 stereo frames)
     for (;;) {
+        drainI2sEvents();   // tally RX overflow / DMA errors every iteration
         size_t br = 0;
         esp_err_t e = i2s_read(I2S_NUM_0, rx, sizeof(rx), &br, portMAX_DELAY);
         if (e != ESP_OK || br < 4) { s_capFail++; vTaskDelay(1); continue; }
@@ -603,6 +651,10 @@ static void audioRxTask(void* /*arg*/) {
 void audioSourceSetup() {
     // Performance-first: source/repeater are mains-powered, so never downclock.
     setCpuFrequencyMhz(240);
+
+    // P0c: log why we (re)booted — distinguishes brownout (v3 LDO dropout) from
+    // a panic/TWDT when chasing the "one-off reset + quality decay" symptom.
+    Serial.printf("[AUDIO-SRC] reset_reason=%d\n", (int)esp_reset_reason());
 
     {
         Preferences p;
@@ -714,10 +766,16 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
     d.setTextDatum(textdatum_t::top_left);
 }
 
-// MODE-select list geometry — 6 rows must fit the 240 px height (box 30, pitch
-// 33 from y0=38 → last row ends at 233). Shared by render + touch hit-test.
-static const int UI_MODE_RY0 = 38;
-static const int UI_MODE_RH  = 33;
+// MODE-select 3×2 grid geometry — row-major RAW|FAST / BALANCED|SMOOTH /
+// STEREO|HIFI (i = row*2 + col). Larger cells than the old 6-row list to stop
+// mis-taps. 3 rows fit the 240 px height (y0 42 + 2×64 + 58 = 228 < 240).
+// Shared by render (uiRepaint) + touch hit-test (uiTouch).
+static const int UI_MODE_X0    = 6;      // left edge of column 0
+static const int UI_MODE_COLP  = 156;    // column pitch (x stride)
+static const int UI_MODE_COLW  = 150;    // cell width
+static const int UI_MODE_Y0    = 42;     // top edge of row 0
+static const int UI_MODE_ROWP  = 64;     // row pitch (y stride)
+static const int UI_MODE_CELLH = 58;     // cell height
 
 // Repaint the whole current screen (static parts).
 static void uiRepaint() {
@@ -742,13 +800,18 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT MODE", 6, 6);
         for (int i = 0; i < MODE_COUNT; i++) {
-            int y = UI_MODE_RY0 + i * UI_MODE_RH; bool cur = (i == m);
-            if (cur) d.fillRoundRect(6, y, 308, 30, 6, UI_SEL_BG);
-            d.drawRoundRect(6, y, 308, 30, 6, cur ? TFT_CYAN : TFT_DARKGREY);
-            d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, cur ? UI_SEL_BG : TFT_BLACK);
-            d.setTextDatum(textdatum_t::middle_left);  d.drawString(MODE_NAME[i], 16, y + 15);
-            d.setTextColor(TFT_DARKGREY, cur ? UI_SEL_BG : TFT_BLACK);
-            d.setTextDatum(textdatum_t::middle_right); d.drawString(MODE_DESC[i], 302, y + 15);
+            int col = i & 1, row = i >> 1;
+            int x = UI_MODE_X0 + col * UI_MODE_COLP;
+            int y = UI_MODE_Y0 + row * UI_MODE_ROWP;
+            bool cur = (i == m);
+            uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
+            if (cur) d.fillRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, UI_SEL_BG);
+            d.drawRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, cur ? TFT_CYAN : TFT_DARKGREY);
+            d.setTextDatum(textdatum_t::top_left);
+            d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, bg);
+            d.drawString(MODE_NAME[i], x + 10, y + 8);
+            d.setTextSize(1); d.setTextColor(TFT_DARKGREY, bg);
+            d.drawString(MODE_DESC[i], x + 10, y + 38);
         }
         d.setTextDatum(textdatum_t::top_left);
     } else {  // UI_CH
@@ -790,7 +853,15 @@ static void uiTouch(int x, int y) {
         if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_MODE : UI_CH; s_uiDirty = true; }
     } else if (s_ui == UI_MODE) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back
-        int i = (y - UI_MODE_RY0) / UI_MODE_RH;
+        if (x < UI_MODE_X0) return;                                 // left of the grid
+        int col = (x - UI_MODE_X0) / UI_MODE_COLP;
+        int row = (y - UI_MODE_Y0) / UI_MODE_ROWP;
+        if (col < 0 || col > 1 || row < 0) return;
+        // Reject taps that land in the gap band between cells (outside the cell rect).
+        int cx = x - (UI_MODE_X0 + col * UI_MODE_COLP);
+        int cy = y - (UI_MODE_Y0 + row * UI_MODE_ROWP);
+        if (cx >= UI_MODE_COLW || cy < 0 || cy >= UI_MODE_CELLH) return;
+        int i = row * 2 + col;
         if (i >= 0 && i < MODE_COUNT) audioSourceSetMode(i);        // saves NVS + reboots
     } else {  // UI_CH
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
@@ -823,6 +894,7 @@ void audioSourceLoop() {
     uiUpdateHome();
     delay(20);
 #else
+    drainI2sEvents();   // tally RX overflow / DMA errors (classic capture path)
     static int16_t cap[CAP_FRAMES * 2];   // interleaved L,R @ 48 kHz
     static int16_t pcm[FRAMES_PKT * 2];   // interleaved L,R @ 16 kHz
 

@@ -53,6 +53,39 @@ static void macToStr(const uint8_t* mac, char* buf, size_t n) {
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+// board string reported in get_info — must match gen_variant.py's VARIANTS
+// table (scripts/gen_variant.py) so Studio's firmware-library board check
+// and device-list board readout agree on the same identifiers.
+#ifdef BOARD_CORES3
+static const char* BOARD_ID = "m5stack_cores3";
+#else
+static const char* BOARD_ID = "m5stack_basic";
+#endif
+
+// Build the default name "<MAC4>-<board>" (underscores -> hyphens), mirroring
+// hapbeat-device-firmware/src/device_identity.h so a transmitter card reads
+// the same way as a receiver card in the Studio device list.
+static String deviceDefaultName() {
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%02X%02X-%s", mac[4], mac[5], BOARD_ID);
+    for (char* c = buf; *c; c++) {
+        if (*c == '_') *c = '-';
+    }
+    return String(buf);
+}
+
+// The user-set name from NVS ("tx" namespace, key "dev_name"), or the
+// board+MAC default when unset.
+static String deviceResolvedName() {
+    Preferences p;
+    p.begin("tx", true);
+    String name = p.getString("dev_name", "");
+    p.end();
+    return name.length() > 0 ? name : deviceDefaultName();
+}
+
 static void handleLine(const char* line) {
     JsonDocument doc;
     if (deserializeJson(doc, line)) return;   // not valid JSON — ignore
@@ -60,22 +93,25 @@ static void handleLine(const char* line) {
 
     JsonDocument r;
 
-    // ---- get_info ----------------------------------------------------------
+    // ---- get_info ------------------------------------------------------
+    // Flat top-level shape (device-firmware serial_config.cpp cmdGetInfo
+    // parity) — Studio's parseSerialInfo (serialMaster.ts) reads name/fw/
+    // role/transport/board straight off the response, not nested under a
+    // "data" object. "fw" (not "firmware") is the key name Studio expects.
     if (strcmp(cmd, "get_info") == 0) {
-        r["status"] = "ok";
-        r["cmd"]    = "get_info";
-        JsonObject d = r["data"].to<JsonObject>();
-        d["name"]      = "hapbeat-transmitter";
-        d["mac"]       = WiFi.macAddress();
-        d["firmware"]  = FIRMWARE_VERSION;
-        d["role"]      = "transmitter";
-        d["transport"] = "espnow_stream";
-        d["board"]     = "m5stack_basic";
-        d["mode"]      = BUILD_MODE;   // "source" | "repeater" | "relay"
+        r["status"]    = "ok";
+        r["cmd"]       = "get_info";
+        r["name"]      = deviceResolvedName();
+        r["mac"]       = WiFi.macAddress();
+        r["fw"]        = FIRMWARE_VERSION;
+        r["role"]      = "transmitter";
+        r["transport"] = "espnow_stream";
+        r["board"]     = BOARD_ID;
+        r["mode"]      = BUILD_MODE;   // "source" | "repeater" | "relay"
 
         Preferences p;
         p.begin("espnow", true);
-        d["espnow_channel"] = p.getUChar("channel", 1);
+        r["espnow_channel"] = p.getUChar("channel", 1);
 
         // relay_src: report as MAC string if set
         uint8_t relay_mac[6] = {};
@@ -84,16 +120,39 @@ static void handleLine(const char* line) {
             p.getBytes("relay_src", relay_mac, 6);
             char mac_str[18];
             macToStr(relay_mac, mac_str, sizeof(mac_str));
-            d["relay_src"] = mac_str;
+            r["relay_src"] = mac_str;
         } else {
-            d["relay_src"] = nullptr;
+            r["relay_src"] = nullptr;
         }
         p.end();
 
         p.begin("tx", true);
-        d["input_level"] = p.getInt("input_level", 50);
+        r["input_level"] = p.getInt("input_level", 50);
         p.end();
 
+        sendResp(r);
+        return;
+    }
+
+    // ---- set_name ------------------------------------------------------
+    // Mirrors device-firmware serial_config.cpp cmdSetName: 32-char
+    // truncate, persist to NVS ("tx"/"dev_name"), echo the stored value.
+    if (strcmp(cmd, "set_name") == 0) {
+        const char* name = doc["name"];
+        if (!name) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "missing name";
+            sendResp(r); return;
+        }
+        char truncated[33];
+        strncpy(truncated, name, 32);
+        truncated[32] = '\0';
+
+        Preferences p; p.begin("tx", false);
+        p.putString("dev_name", truncated);
+        p.end();
+
+        r["status"] = "ok"; r["cmd"] = cmd; r["name"] = truncated;
         sendResp(r);
         return;
     }
