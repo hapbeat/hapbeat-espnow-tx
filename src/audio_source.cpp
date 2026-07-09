@@ -89,6 +89,7 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //   4 STEREO   OPUS   8k stereo  80-smp(10ms)   pb2  dual-channel haptics, 8 kHz
 //   5 HIFI     OPUS  16k stereo 160-smp(10ms)   pb2  dual-channel, full 16 kHz band
 //   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb3  zero-encode mono (CoreS3 8k path)
+//   7 TURBO    ADPCM  8k mono    40-smp(5ms)    pb3  same wire as LITE — 4ms RX buffer (min latency, drops-tolerant)
 // Per-mode worst-case packet size vs the 250 B ESP-NOW limit (ESP_NOW_MAX_DATA_LEN):
 //   Opus body = type1+mode1+seq1+pbcnt1 + len1 + flen ; each pb entry = seq1+len1+flen.
 //     FAST/BAL  flen=30, pb3: 4 + 1 + 30 + 3*(2+30) = 131 B  <=250 ✓
@@ -97,13 +98,14 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //     HIFI      flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
 //   ADPCM body = type1+mode1+seq1+pbcnt1 + nf1 + state + data ; each pb entry = seq1+state+data.
 //     RAW  (mode0) 64-frame stereo: state6 + data64, pb1 (unchanged, ~148 B).
-//     LITE (mode6) 8k mono: state3 + data20, pb3: 4 + 1 + 3 + 20 + 3*(1+3+20) = 100 B  <=250 ✓
+//     LITE (mode6)/TURBO (mode7) 8k mono: state3 + data20, pb3: 4 + 1 + 3 + 20 + 3*(1+3+20) = 100 B  <=250 ✓
 // Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only). Mode 6
-// (LITE / ADPCM 8k mono) is also CoreS3-only — its decimate+encode path lives in
-// audioRxTask; the classic loop always ships mode 0 (16 kHz stereo ADPCM).
+// (LITE / ADPCM 8k mono) and mode 7 (TURBO, same wire as LITE) are also CoreS3-only
+// — their decimate+encode path lives in audioRxTask; the classic loop always ships
+// mode 0 (16 kHz stereo ADPCM).
 enum StreamMode : uint8_t {
     MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3,
-    MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_COUNT = 7
+    MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_TURBO = 7, MODE_COUNT = 8
 };
 struct ModeDef {
     uint8_t  codec;       // 0 = ADPCM, 1 = OPUS
@@ -122,18 +124,22 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 1,  8000, 2,  80, 2, 64000, 5 },   // 4 STEREO   Opus  8k stereo 10 ms  pb2 (249 B, at the 250 limit)
     { 1, 16000, 2, 160, 2, 60000, 5 },   // 5 HIFI     Opus 16k stereo 10 ms  pb2 (234 B; c5 postfilter — fixes c2 amplitude wobble; verify enc<70% on HW)
     { 0,  8000, 1,  40, 3,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  pb3 (100 B; opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
+    { 0,  8000, 1,  40, 3,     0, 0 },   // 7 TURBO    ADPCM 8k mono   5 ms  pb3 — identical wire to LITE (mode 6); only the RX jitter buffer differs (4ms vs 16ms)
 };
 // User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
-// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz; LITE=zero-encode ADPCM mono).
+// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz; LITE=zero-encode ADPCM mono;
+// TURBO=LITE wire + shallow RX buffer for minimum latency).
 static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED",
-                                               "SMOOTH", "STEREO", "HIFI", "LITE" };
+                                               "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
                                                "Opus 15ms", "Opus 28ms",
-                                               "Opus 18ms", "Opus 28ms", "ADPCM 8ms" };
+                                               "Opus 18ms", "Opus 28ms", "ADPCM 8ms",
+                                               "ADPCM 4ms buf" };
 // Audio format per mode (rate + channels), shown on the sender HOME screen.
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
                                                "8kHz Mono", "8kHz Mono",
                                                "8kHz Stereo", "16kHz Stereo",
+                                               "8kHz Mono ADPCM",
                                                "8kHz Mono ADPCM" };
 static const int      OPUS_MAX_LEN         = 160;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
@@ -201,6 +207,12 @@ static          int64_t  s_rsum = 0;
 static          uint32_t s_scnt = 0;
 static          uint32_t s_capFail = 0;
 static          bool     s_codecOk = true;   // CoreS3: ES8388/STM32 begin() result
+
+// ---- HOME input-level meter: running peak of |sample| (full-scale 0..32768) --
+// Written per captured sample in rawStat (any capture path); read + reset in
+// uiUpdateHome so the meter reflects the last ~0.4 s. volatile: rawStat runs in
+// the CoreS3 capture task (core 1) while uiUpdateHome runs in the Arduino loop.
+static volatile uint16_t s_uiLpk = 0, s_uiRpk = 0;
 
 // ---- piggyback state (saved from the last successfully enqueued packet) ----
 static bool       s_has_prev      = false;
@@ -295,6 +307,12 @@ static inline void rawStat(int16_t l, int16_t r) {
     if (r > s_rmax) s_rmax = r;
     s_rsum += r;
     s_scnt++;
+    // HOME meter: track running peak of |sample|. -(int32_t) so abs(-32768)=32768
+    // fits uint16 (full-scale) instead of overflowing int16.
+    uint16_t al = (uint16_t)(l < 0 ? -(int32_t)l : (int32_t)l);
+    uint16_t ar = (uint16_t)(r < 0 ? -(int32_t)r : (int32_t)r);
+    if (al > s_uiLpk) s_uiLpk = al;
+    if (ar > s_uiRpk) s_uiRpk = ar;
 }
 
 // Periodic serial heartbeat (~2 s) for headless verification.
@@ -619,14 +637,16 @@ static uint8_t    s_monoHistSeq[3];
 static AdpcmState s_monoHistSm[3];                        // encoder state BEFORE each block
 static uint8_t    s_monoHistData[3][MONO8K_DBYTES];
 
-// Encode one 40-sample 8 kHz mono block and broadcast a mode-6 0xAA packet with
-// up to depth-3 piggyback (MODE_DEFS[6].piggyback). Mirrors streamEncodeAndSend()'s
-// in-flight/seq/prev-frame bookkeeping but for the 3-byte mono state (pred int16
-// LE + step).
+// Encode one 40-sample 8 kHz mono block and broadcast a mode-6 (LITE) or mode-7
+// (TURBO) 0xAA packet with up to depth-3 piggyback (MODE_DEFS[mode].piggyback).
+// LITE and TURBO share this exact encode/wire path — `mode` only selects which
+// mode_id ships in the header (the RX-side jitter buffer depth is what differs).
+// Mirrors streamEncodeAndSend()'s in-flight/seq/prev-frame bookkeeping but for
+// the 3-byte mono state (pred int16 LE + step).
 // Body: [4]=num_frames(40) [5..7]=state(pred_lo,pred_hi,step) [8..27]=data(20);
 //       then pb× [prev_seq(1)][pred_lo][pred_hi][step][data(20)] (oldest first).
 // Max 100 B (pb=3): 4 + 1 + 3 + 20 + 3*(1+3+20).
-static void streamEncodeAndSendMono(const int16_t* mono) {
+static void streamEncodeAndSendMono(const int16_t* mono, uint8_t mode) {
     // Snapshot encoder state BEFORE this block (goes into the header so the
     // receiver can re-sync per packet).
     AdpcmState pre_m = s_sm;
@@ -644,14 +664,16 @@ static void streamEncodeAndSendMono(const int16_t* mono) {
         return;
     }
 
-    // pb entries this packet = min(configured depth, valid history).
-    int depth = MODE_DEFS[MODE_MONO8K].piggyback;
+    // pb entries this packet = min(configured depth, valid history). LITE and
+    // TURBO share MODE_DEFS.piggyback (both 3) — indexing by `mode` keeps this
+    // correct if that ever diverges.
+    int depth = MODE_DEFS[mode].piggyback;
     int pbn   = s_monoHistN < depth ? s_monoHistN : depth;
 
     uint8_t pkt[4 + 1 + 3 + MONO8K_DBYTES + 3 * (1 + 3 + MONO8K_DBYTES)];
     size_t  pkt_len = 0;
     pkt[pkt_len++] = STREAM_TYPE;
-    pkt[pkt_len++] = MODE_MONO8K;
+    pkt[pkt_len++] = mode;
     pkt[pkt_len++] = s_seq;
     pkt[pkt_len++] = (uint8_t)pbn;                    // pb_count
     pkt[pkt_len++] = (uint8_t)MONO8K_FRAMES;          // num_frames (mono samples)
@@ -737,7 +759,7 @@ static void audioRxTask(void* /*arg*/) {
                     monoDecPhase = 0;                   // mono 16k→8k decimation phase
                     if (MODE_DEFS[mode].codec == 1) {
                         opusEncoderConfig(mode);        // Opus modes (1-5): (re)configure encoder
-                    } else if (mode == MODE_MONO8K) {
+                    } else if (mode == MODE_MONO8K || mode == MODE_TURBO) {
                         adpcmStateInit(&s_sm);          // fresh mono encoder state
                         s_monoHistN = 0;                // drop stale mono piggyback
                     }
@@ -747,16 +769,17 @@ static void audioRxTask(void* /*arg*/) {
                     accum[accumIdx * 2]     = (int16_t)l;
                     accum[accumIdx * 2 + 1] = (int16_t)r;
                     if (++accumIdx >= FRAMES_PKT) { streamEncodeAndSend(accum); accumIdx = 0; }
-                } else if (mode == MODE_MONO8K) {
-                    // 8 kHz mono ADPCM (LITE): downmix + 2:1 decimate 16k stereo → 8k
-                    // mono (same as the 8k-mono Opus path), then pack 40 samples
-                    // (5 ms) into one mode-6 ADPCM packet.
+                } else if (mode == MODE_MONO8K || mode == MODE_TURBO) {
+                    // 8 kHz mono ADPCM (LITE / TURBO — identical encode+wire, only
+                    // the receiver's jitter buffer depth differs): downmix + 2:1
+                    // decimate 16k stereo → 8k mono (same as the 8k-mono Opus path),
+                    // then pack 40 samples (5 ms) into one mode-6/7 ADPCM packet.
                     int32_t mono16 = ((int32_t)l + r) / 2;
                     if (monoDecPhase == 0) { monoDecPrev = mono16; monoDecPhase = 1; }
                     else {
                         monoDecPhase = 0;
                         monoAccum[monoAccumN++] = (int16_t)((monoDecPrev + mono16) / 2);
-                        if (monoAccumN >= MONO8K_FRAMES) { streamEncodeAndSendMono(monoAccum); monoAccumN = 0; }
+                        if (monoAccumN >= MONO8K_FRAMES) { streamEncodeAndSendMono(monoAccum, mode); monoAccumN = 0; }
                     }
                 } else if (MODE_DEFS[mode].rate >= 16000) {
                     // 16 kHz Opus: no decimation. Stereo keeps L/R; mono downmixes.
@@ -908,15 +931,15 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
 enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_COUNT = 2 };
 static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS" };
 static const char* const FAM_HINT[FAM_COUNT] = { "low latency", "quality" };
-static const uint8_t FAM_ADPCM_MODES[] = { MODE_ADPCM, MODE_MONO8K };                 // RAW, LITE
+static const uint8_t FAM_ADPCM_MODES[] = { MODE_ADPCM, MODE_MONO8K, MODE_TURBO };      // RAW, LITE, TURBO
 static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_STEREO, MODE_HIFI };
 struct FamilyDef { const uint8_t* modes; uint8_t count; };
 static const FamilyDef FAMILY[FAM_COUNT] = {
-    { FAM_ADPCM_MODES, 2 },
+    { FAM_ADPCM_MODES, 3 },
     { FAM_OPUS_MODES,  5 },
 };
 static inline uint8_t familyOf(uint8_t mode) {
-    return (mode == MODE_ADPCM || mode == MODE_MONO8K) ? FAM_ADPCM : FAM_OPUS;
+    return (mode == MODE_ADPCM || mode == MODE_MONO8K || mode == MODE_TURBO) ? FAM_ADPCM : FAM_OPUS;
 }
 static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
 
@@ -930,6 +953,42 @@ static const int UI_MODE_COLW  = 150;    // cell width
 static const int UI_MODE_Y0    = 42;     // top edge of row 0
 static const int UI_MODE_ROWP  = 64;     // row pitch (y stride)
 static const int UI_MODE_CELLH = 58;     // cell height
+
+// HOME input-level meter geometry (developer diagnostic, right of the mode info,
+// in the blank area above the CHANNEL button). x kept ≥166 so the widest
+// MODE_DESC ("ADPCM 4ms buf") never reaches the bars. Two rows: L (upper),
+// R (lower); frame drawn in uiRepaint, fill/readout in uiUpdateHome.
+static const int MTR_X   = 166;   // left edge of the meter column
+static const int MTR_W   = 148;   // bar/frame width (166..314)
+static const int MTR_H   = 10;    // bar height
+static const int MTR_LTX = 56;    // L numeric-readout text y
+static const int MTR_LBY = 68;    // L bar frame y
+static const int MTR_RTX = 90;    // R numeric-readout text y
+static const int MTR_RBY = 102;   // R bar frame y
+
+// Draw one input-level meter row: bar fill (proportional to peak/full-scale) +
+// numeric %/CLIP. peak = |sample| 0..32768 (full scale). Color green <70% /
+// yellow 70..94% / red ≥95%; a bright-red "CLIP" replaces the % at peak ≥32000
+// (ADC near ±full-scale — the key "back off the source" signal). Interior fill
+// only, so the 1px static frame from uiRepaint stays intact.
+static void uiMeterRow(int barY, int txtY, char tag, uint16_t peak) {
+    auto& d = M5.Display;
+    uint32_t pct = (uint32_t)peak * 100u / 32768u;
+    if (pct > 100) pct = 100;
+    int fill = (int)((uint32_t)peak * (uint32_t)(MTR_W - 2) / 32768u);
+    if (fill > MTR_W - 2) fill = MTR_W - 2;
+    uint16_t col = (pct >= 95) ? TFT_RED : (pct >= 70) ? TFT_YELLOW : TFT_GREEN;
+    d.fillRect(MTR_X + 1, barY + 1, MTR_W - 2, MTR_H - 2, TFT_BLACK);
+    if (fill > 0) d.fillRect(MTR_X + 1, barY + 1, fill, MTR_H - 2, col);
+    bool clip = (peak >= 32000);
+    char rd[16];
+    if (clip) snprintf(rd, sizeof(rd), "%c CLIP ", tag);
+    else      snprintf(rd, sizeof(rd), "%c %3lu%% ", tag, (unsigned long)pct);
+    d.setTextSize(1);
+    d.setTextColor(clip ? TFT_RED : col, TFT_BLACK);
+    d.setTextDatum(textdatum_t::top_left);
+    d.drawString(rd, MTR_X, txtY);
+}
 
 // Repaint the whole current screen (static parts).
 static void uiRepaint() {
@@ -948,6 +1007,11 @@ static void uiRepaint() {
         d.drawString(MODE_NAME[m], 8, 58);
         d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString(MODE_DESC[m], 8, 96);
         d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.drawString(MODE_FMT[m], 8, 120);
+        // Input-level meter frame + header (static; bars/readouts in uiUpdateHome).
+        d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("INPUT PEAK", MTR_X, 44);
+        d.drawRect(MTR_X, MTR_LBY, MTR_W, MTR_H, TFT_DARKGREY);
+        d.drawRect(MTR_X, MTR_RBY, MTR_W, MTR_H, TFT_DARKGREY);
         uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
         uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
     } else if (s_ui == UI_FAMILY) {
@@ -1020,6 +1084,13 @@ static void uiUpdateHome() {
     char st[32]; snprintf(st, sizeof(st), "%lu pkt/s drop %lu    ",
                           (unsigned long)pps, (unsigned long)s_txDroppedBusy);
     d.drawString(st, 8, 210);
+
+    // Input-level meter: snapshot + reset the peak trackers (last ~0.4 s) and
+    // render the L/R bars + %/CLIP. Reset so each window reflects recent audio.
+    uint16_t lpk = s_uiLpk, rpk = s_uiRpk;
+    s_uiLpk = 0; s_uiRpk = 0;
+    uiMeterRow(MTR_LBY, MTR_LTX, 'L', lpk);
+    uiMeterRow(MTR_RBY, MTR_RTX, 'R', rpk);
 }
 
 // Dispatch one touch-release at (x,y) based on the current screen.
@@ -1121,11 +1192,12 @@ void audioSourceApplyInputLevel(int level) {
 }
 
 // Live stream-mode select (0=RAW/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
-// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono). Persisted to NVS, then reboots into the
-// mode (a clean boot per mode is proven stable; a live re-init crashed the
-// encoder). On the classic (non-CoreS3) sender only mode 0 is available — Opus
-// needs the CoreS3, and the LITE (6) mono decimate/encode path also lives in the
-// CoreS3-only audioRxTask (the classic loop always ships mode 0).
+// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono, 7=TURBO/ADPCM-mono). Persisted to NVS,
+// then reboots into the mode (a clean boot per mode is proven stable; a live
+// re-init crashed the encoder). On the classic (non-CoreS3) sender only mode 0
+// is available — Opus needs the CoreS3, and the LITE (6) / TURBO (7) mono
+// decimate/encode path also lives in the CoreS3-only audioRxTask (the classic
+// loop always ships mode 0).
 void audioSourceSetMode(int mode) {
     if (mode < 0 || mode >= MODE_COUNT) return;
 #ifndef BOARD_CORES3
