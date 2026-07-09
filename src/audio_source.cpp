@@ -104,11 +104,11 @@ struct ModeDef {
 };
 static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 0, 16000, 2,   0, 1,     0, 0 },   // 0 RAW      ADPCM 16k stereo
-    { 1,  8000, 1,  40, 1, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms
-    { 1,  8000, 1,  40, 1, 48000, 2 },   // 2 BALANCED Opus  8k mono    5 ms
+    { 1,  8000, 1,  40, 1, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms  (c2: low-latency, cheap)
+    { 1,  8000, 1,  40, 1, 48000, 5 },   // 2 BALANCED Opus  8k mono    5 ms
     { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms
-    { 1,  8000, 2,  80, 1, 64000, 2 },   // 4 STEREO   Opus  8k stereo 10 ms
-    { 1, 16000, 2, 160, 2, 60000, 0 },   // 5 HIFI     Opus 16k stereo 10 ms
+    { 1,  8000, 2,  80, 1, 64000, 5 },   // 4 STEREO   Opus  8k stereo 10 ms
+    { 1, 16000, 2, 160, 2, 60000, 2 },   // 5 HIFI     Opus 16k stereo 10 ms
 };
 // User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
 // ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz).
