@@ -82,7 +82,7 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 // The sender picks the mode; the receiver reads mode_id and auto-adapts its
 // decode + jitter-buffer depth. Table MUST match device-firmware
 // espnow_stream.cpp RX_MODE. See docs/instructions-espnow-modes-button-ui-*.
-//   0 RAW      ADPCM 16k stereo 64-frame(4ms)  pb1  compat/floor (classic+CoreS3)
+//   0 SOLID    ADPCM 16k stereo 64-frame(4ms)  pb1  compat/floor, high-reliability (classic+CoreS3)
 //   1 FAST     OPUS   8k mono    40-smp(5ms)    pb3  low-latency
 //   2 BALANCED OPUS   8k mono    40-smp(5ms)    pb3  middle (deeper RX buffer)
 //   3 SMOOTH   OPUS   8k mono    80-smp(10ms)   pb2  robust (deepest + 2× pb)
@@ -90,14 +90,16 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //   5 HIFI     OPUS  16k stereo 160-smp(10ms)   pb2  dual-channel, full 16 kHz band
 //   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb3  zero-encode mono (CoreS3 8k path)
 //   7 TURBO    ADPCM  8k mono    40-smp(5ms)    pb3  same wire as LITE — 4ms RX buffer (min latency, drops-tolerant)
+//   8 FINE     OPUS  16k mono   160-smp(10ms)   pb2  mono full-band (16 kHz mono middle ground between SMOOTH and HIFI)
 // Per-mode worst-case packet size vs the 250 B ESP-NOW limit (ESP_NOW_MAX_DATA_LEN):
 //   Opus body = type1+mode1+seq1+pbcnt1 + len1 + flen ; each pb entry = seq1+len1+flen.
 //     FAST/BAL  flen=30, pb3: 4 + 1 + 30 + 3*(2+30) = 131 B  <=250 ✓
 //     SMOOTH    flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
 //     STEREO    flen=80, pb2: 4 + 1 + 80 + 2*(2+80) = 249 B  <=250 ✓ (at the limit)
 //     HIFI      flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
+//     FINE      flen=60, pb2: 4 + 1 + 60 + 2*(2+60) = 189 B  <=250 ✓ (16k mono @48kbps CBR)
 //   ADPCM body = type1+mode1+seq1+pbcnt1 + nf1 + state + data ; each pb entry = seq1+state+data.
-//     RAW  (mode0) 64-frame stereo: state6 + data64, pb1 (unchanged, ~148 B).
+//     SOLID (mode0) 64-frame stereo: state6 + data64, pb1 (unchanged, ~148 B).
 //     LITE (mode6)/TURBO (mode7) 8k mono: state3 + data20, pb3: 4 + 1 + 3 + 20 + 3*(1+3+20) = 100 B  <=250 ✓
 // Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only). Mode 6
 // (LITE / ADPCM 8k mono) and mode 7 (TURBO, same wire as LITE) are also CoreS3-only
@@ -105,7 +107,8 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 // mode 0 (16 kHz stereo ADPCM).
 enum StreamMode : uint8_t {
     MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3,
-    MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_TURBO = 7, MODE_COUNT = 8
+    MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_TURBO = 7,
+    MODE_FINE = 8, MODE_COUNT = 9
 };
 struct ModeDef {
     uint8_t  codec;       // 0 = ADPCM, 1 = OPUS
@@ -117,7 +120,7 @@ struct ModeDef {
     uint8_t  complexity;  // Opus complexity 0-10 (postfilter/tf gates at ≥2/≥5)
 };
 static const ModeDef MODE_DEFS[MODE_COUNT] = {
-    { 0, 16000, 2,   0, 1,     0, 0 },   // 0 RAW      ADPCM 16k stereo         pb1 (unchanged)
+    { 0, 16000, 2,   0, 1,     0, 0 },   // 0 SOLID    ADPCM 16k stereo         pb1 (unchanged, high-reliability)
     { 1,  8000, 1,  40, 3, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms  pb3 (131 B; c2: low-latency, cheap)
     { 1,  8000, 1,  40, 3, 48000, 5 },   // 2 BALANCED Opus  8k mono    5 ms  pb3 (131 B)
     { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms  pb2 (234 B; pb3 would exceed 250)
@@ -125,22 +128,26 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 1, 16000, 2, 160, 2, 60000, 5 },   // 5 HIFI     Opus 16k stereo 10 ms  pb2 (234 B; c5 postfilter — fixes c2 amplitude wobble; verify enc<70% on HW)
     { 0,  8000, 1,  40, 3,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  pb3 (100 B; opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
     { 0,  8000, 1,  40, 3,     0, 0 },   // 7 TURBO    ADPCM 8k mono   5 ms  pb3 — identical wire to LITE (mode 6); only the RX jitter buffer differs (4ms vs 16ms)
+    { 1, 16000, 1, 160, 2, 48000, 5 },   // 8 FINE     Opus 16k mono   10 ms  pb2 (189 B; mono full-band, between SMOOTH and HIFI)
 };
-// User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
-// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz; LITE=zero-encode ADPCM mono;
-// TURBO=LITE wire + shallow RX buffer for minimum latency).
-static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED",
-                                               "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO" };
+// User-facing names (SOLID=ADPCM high-reliability baseline; FAST/BALANCED/SMOOTH=
+// Opus mono latency ladder; FINE=Opus 16k mono full-band; STEREO/HIFI=dual-channel
+// Opus at 8/16 kHz; LITE=zero-encode ADPCM mono; TURBO=LITE wire + shallow RX
+// buffer for minimum latency).
+static const char*   MODE_NAME[MODE_COUNT] = { "SOLID", "FAST", "BALANCED",
+                                               "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO",
+                                               "FINE" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
                                                "Opus 15ms", "Opus 28ms",
                                                "Opus 18ms", "Opus 28ms", "ADPCM 8ms",
-                                               "ADPCM 4ms buf" };
+                                               "ADPCM 4ms buf", "Opus 16k mono" };
 // Audio format per mode (rate + channels), shown on the sender HOME screen.
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
                                                "8kHz Mono", "8kHz Mono",
                                                "8kHz Stereo", "16kHz Stereo",
                                                "8kHz Mono ADPCM",
-                                               "8kHz Mono ADPCM" };
+                                               "8kHz Mono ADPCM",
+                                               "16kHz Mono" };
 static const int      OPUS_MAX_LEN         = 160;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
 // s_opusAccum is [OPUS_MAX_SMP*2] (per-channel × up to 2 ch). Guard that the
@@ -212,7 +219,8 @@ static          bool     s_codecOk = true;   // CoreS3: ES8388/STM32 begin() res
 // Written per captured sample in rawStat (any capture path); read + reset in
 // uiUpdateHome so the meter reflects the last ~0.4 s. volatile: rawStat runs in
 // the CoreS3 capture task (core 1) while uiUpdateHome runs in the Arduino loop.
-static volatile uint16_t s_uiLpk = 0, s_uiRpk = 0;
+static volatile uint16_t s_uiLpk = 0, s_uiRpk = 0;      // trimmed AC peak (bar level)
+static volatile uint16_t s_rawLpk = 0, s_rawRpk = 0;    // RAW ADC peak (clip detect)
 
 // ---- piggyback state (saved from the last successfully enqueued packet) ----
 static bool       s_has_prev      = false;
@@ -307,12 +315,16 @@ static inline void rawStat(int16_t l, int16_t r) {
     if (r > s_rmax) s_rmax = r;
     s_rsum += r;
     s_scnt++;
-    // HOME meter: track running peak of |sample|. -(int32_t) so abs(-32768)=32768
-    // fits uint16 (full-scale) instead of overflowing int16.
+    // Meter CLIP detection reads the RAW ADC peak here (pre-trim): the ADC
+    // saturates on the raw sample, so clipping must be judged BEFORE the L/R
+    // balance trim (which scales R down and would otherwise hide R's clipping —
+    // R can clip the ADC while its trimmed bar still reads ~45%).
     uint16_t al = (uint16_t)(l < 0 ? -(int32_t)l : (int32_t)l);
     uint16_t ar = (uint16_t)(r < 0 ? -(int32_t)r : (int32_t)r);
-    if (al > s_uiLpk) s_uiLpk = al;
-    if (ar > s_uiRpk) s_uiRpk = ar;
+    if (al > s_rawLpk) s_rawLpk = al;
+    if (ar > s_rawRpk) s_rawRpk = ar;
+    // The level BARS read the DC-blocked, L/R-balanced signal in audioRxTask
+    // (s_uiLpk/s_uiRpk) — the raw DC offset would mislead the bar level.
 }
 
 // Periodic serial heartbeat (~2 s) for headless verification.
@@ -746,8 +758,21 @@ static void audioRxTask(void* /*arg*/) {
                 const float DCA = 0.996f;
                 dcyl = (float)l - dcxl + DCA * dcyl; dcxl = (float)l; l = (int32_t)dcyl;
                 dcyr = (float)r - dcxr + DCA * dcyr; dcxr = (float)r; r = (int32_t)dcyr;
+                // Per-channel L/R balance: the M5 Module-Audio line-in captures R
+                // ~+3.3 dB hotter than L (analog ES8388/board mismatch; measured
+                // R/L=1.47 with a balanced source). The M5 library exposes no per-
+                // channel gain and the ES8388 ADC-volume register did not attenuate
+                // it, so trim R here on the DC-blocked signal. Balances both the
+                // encoded stream and the meter. Tune R_TRIM_PCT (100 = no trim).
+                static const int R_TRIM_PCT = 68;        // R * 0.68 ≈ -3.3 dB
+                r = (int32_t)r * R_TRIM_PCT / 100;
                 if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
                 if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+                // HOME level meter: peak of the DC-blocked, L/R-balanced AC signal.
+                { uint16_t al = (uint16_t)(l < 0 ? -l : l);
+                  uint16_t ar = (uint16_t)(r < 0 ? -r : r);
+                  if (al > s_uiLpk) s_uiLpk = al;
+                  if (ar > s_uiRpk) s_uiRpk = ar; }
 
                 // Route by the (live-switchable) stream mode.
                 uint8_t mode = s_mode;
@@ -758,7 +783,7 @@ static void audioRxTask(void* /*arg*/) {
                     monoAccumN = 0;                     // mono ADPCM  (mode 6) block
                     monoDecPhase = 0;                   // mono 16k→8k decimation phase
                     if (MODE_DEFS[mode].codec == 1) {
-                        opusEncoderConfig(mode);        // Opus modes (1-5): (re)configure encoder
+                        opusEncoderConfig(mode);        // Opus modes (1-5, 8): (re)configure encoder
                     } else if (mode == MODE_MONO8K || mode == MODE_TURBO) {
                         adpcmStateInit(&s_sm);          // fresh mono encoder state
                         s_monoHistN = 0;                // drop stale mono piggyback
@@ -874,14 +899,26 @@ void audioSourceSetup() {
         s_audio.setMicAdcVolume(100);                         // digital ADC vol = 0 dB (max)
         s_audio.setBitsSample(ES_MODULE_ADC, BIT_LENGTH_16BITS);
         s_audio.setSampleRate(SAMPLE_RATE_48K);               // codec ADC @ 48 kHz
-        // Disable ALC. The M5 driver's ES8388 init() enables stereo ALC "for
-        // VOICE" (reg 0x0E=0xEA). Line-in does NOT want auto-leveling — ALC rides
-        // the gain and pumps on sustained tones (adds noise) and can skew L/R.
-        // reg 0x0E bits[7:6]=00 = ALC off; fixed PGA (setMicGain) then applies.
+        // Disable ALC — at the CORRECT register. The M5 driver enables stereo ALC
+        // at max gain (ADCCONTROL10 = reg 0x12 = 0xEA). Line-in does NOT want auto-
+        // leveling: on a quiet/line input the ALC ramps the PGA to max gain, which
+        // AMPLIFIES the ADC's DC offset + noise (measured raw idle ~ -19000/-24800 =
+        // huge DC, with R>L because ALC is per-channel) and pumps on sustained tones.
+        // Set ALCSEL (bits[7:6]) = 00 to turn ALC OFF so the fixed PGA (setMicGain)
+        // applies. IMPORTANT: the ALC is at 0x12 (ADCCONTROL10); 0x0E (ADCCONTROL6)
+        // is the ADC HIGH-PASS FILTER. The previous code wrote 0x0E=0x00 believing
+        // it was the ALC register — that never disabled the ALC (leaving the DC
+        // offset / R clipping) and poked the HPF instead. Confirmed via es8388.hpp
+        // (#define ES8388_ADCCONTROL10 0x12) + ES8388 datasheet.
         Wire.beginTransmission(0x10);   // ES8388 I2C address
-        Wire.write(0x0E); Wire.write(0x00);
+        Wire.write(0x12); Wire.write(0x00);   // ADCCONTROL10: ALCSEL=00 (ALC off)
         Wire.endTransmission();
-        Serial.printf("[AUDIO-SRC] ES8388 ready (CoreS3, switch A), PGA idx=%d, ALC off\n",
+        // NOTE: the L/R balance trim is applied DIGITALLY in audioRxTask (R_TRIM_PCT),
+        // not via an ES8388 register. The ADC digital-volume register (ADCCONTROL9 =
+        // 0x11) was measured to NOT attenuate the R capture (write took, ratio
+        // unchanged), so a firmware-domain trim on the DC-blocked signal is used
+        // instead — reliable, and it also balances the on-screen level meter.
+        Serial.printf("[AUDIO-SRC] ES8388 ready (CoreS3, switch A), PGA idx=%d, ALC off (0x12=0)\n",
                       (int)pgaFromLevel(s_input_level));
     }
 
@@ -927,24 +964,24 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
 
 // ---- Two-level mode picker: family (ADPCM / OPUS) -> mode within it --------
 // The wire mode_id is unchanged; this only groups the on-screen selector so the
-// 3x2 grid never needs a 4th row (ADPCM has 2 modes, OPUS has 5 — both fit).
+// 3x2 grid never needs a 4th row (ADPCM has 3 modes, OPUS has 6 — both fit the 3×2 grid).
 enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_COUNT = 2 };
 static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS" };
 static const char* const FAM_HINT[FAM_COUNT] = { "low latency", "quality" };
-static const uint8_t FAM_ADPCM_MODES[] = { MODE_ADPCM, MODE_MONO8K, MODE_TURBO };      // RAW, LITE, TURBO
-static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_STEREO, MODE_HIFI };
+static const uint8_t FAM_ADPCM_MODES[] = { MODE_TURBO, MODE_MONO8K, MODE_ADPCM };      // TURBO, LITE, SOLID (low-latency -> robust)
+static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_FINE, MODE_STEREO, MODE_HIFI }; // FAST, BALANCED, SMOOTH, FINE, STEREO, HIFI (low-latency -> high-quality)
 struct FamilyDef { const uint8_t* modes; uint8_t count; };
 static const FamilyDef FAMILY[FAM_COUNT] = {
     { FAM_ADPCM_MODES, 3 },
-    { FAM_OPUS_MODES,  5 },
+    { FAM_OPUS_MODES,  6 },
 };
 static inline uint8_t familyOf(uint8_t mode) {
     return (mode == MODE_ADPCM || mode == MODE_MONO8K || mode == MODE_TURBO) ? FAM_ADPCM : FAM_OPUS;
 }
 static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
 
-// MODE-select 3×2 grid geometry — row-major RAW|FAST / BALANCED|SMOOTH /
-// STEREO|HIFI (i = row*2 + col). Larger cells than the old 6-row list to stop
+// MODE-select 3×2 grid geometry — row-major, i = row*2 + col (e.g. the OPUS
+// family fills FAST|BALANCED / SMOOTH|FINE / STEREO|HIFI). Larger cells than the old 6-row list to stop
 // mis-taps. 3 rows fit the 240 px height (y0 42 + 2×64 + 58 = 228 < 240).
 // Shared by render (uiRepaint) + touch hit-test (uiTouch).
 static const int UI_MODE_X0    = 6;      // left edge of column 0
@@ -971,7 +1008,7 @@ static const int MTR_RBY = 102;   // R bar frame y
 // yellow 70..94% / red ≥95%; a bright-red "CLIP" replaces the % at peak ≥32000
 // (ADC near ±full-scale — the key "back off the source" signal). Interior fill
 // only, so the 1px static frame from uiRepaint stays intact.
-static void uiMeterRow(int barY, int txtY, char tag, uint16_t peak) {
+static void uiMeterRow(int barY, int txtY, char tag, uint16_t peak, uint16_t rawPeak) {
     auto& d = M5.Display;
     uint32_t pct = (uint32_t)peak * 100u / 32768u;
     if (pct > 100) pct = 100;
@@ -980,7 +1017,9 @@ static void uiMeterRow(int barY, int txtY, char tag, uint16_t peak) {
     uint16_t col = (pct >= 95) ? TFT_RED : (pct >= 70) ? TFT_YELLOW : TFT_GREEN;
     d.fillRect(MTR_X + 1, barY + 1, MTR_W - 2, MTR_H - 2, TFT_BLACK);
     if (fill > 0) d.fillRect(MTR_X + 1, barY + 1, fill, MTR_H - 2, col);
-    bool clip = (peak >= 32000);
+    // CLIP judged on the RAW ADC (pre-trim) — the true saturation point. R can
+    // hit the ADC rail while its trimmed bar reads well under 100%.
+    bool clip = (rawPeak >= 32000);
     char rd[16];
     if (clip) snprintf(rd, sizeof(rd), "%c CLIP ", tag);
     else      snprintf(rd, sizeof(rd), "%c %3lu%% ", tag, (unsigned long)pct);
@@ -1012,6 +1051,12 @@ static void uiRepaint() {
         d.setTextDatum(textdatum_t::top_left); d.drawString("INPUT PEAK", MTR_X, 44);
         d.drawRect(MTR_X, MTR_LBY, MTR_W, MTR_H, TFT_DARKGREY);
         d.drawRect(MTR_X, MTR_RBY, MTR_W, MTR_H, TFT_DARKGREY);
+        // pkt/s + drop: static labels here; only the numbers are redrawn (fixed
+        // 3/4-digit width) in uiUpdateHome, so the labels never shift.
+        d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left);
+        d.drawString("pkt/s", 48, 210);
+        d.drawString("drop", 122, 210);
         uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
         uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
     } else if (s_ui == UI_FAMILY) {
@@ -1080,17 +1125,23 @@ static void uiUpdateHome() {
     lastPkt = s_txPktSent;
     auto& d = M5.Display;
     d.setTextSize(2); d.setTextDatum(textdatum_t::top_left);
-    d.setTextColor(s_txDroppedBusy ? TFT_YELLOW : TFT_GREEN, TFT_BLACK);
-    char st[32]; snprintf(st, sizeof(st), "%lu pkt/s drop %lu    ",
-                          (unsigned long)pps, (unsigned long)s_txDroppedBusy);
-    d.drawString(st, 8, 210);
+    // Redraw ONLY the numbers (fixed width, opaque) — the "pkt/s"/"drop" labels are
+    // static (uiRepaint), so nothing shifts as the digit count changes.
+    char nb[8];
+    if (pps > 999) pps = 999;
+    snprintf(nb, sizeof(nb), "%3lu", (unsigned long)pps);
+    d.setTextColor(TFT_GREEN, TFT_BLACK); d.drawString(nb, 8, 210);
+    uint32_t drp = s_txDroppedBusy > 9999 ? 9999 : s_txDroppedBusy;
+    snprintf(nb, sizeof(nb), "%4lu", (unsigned long)drp);
+    d.setTextColor(drp ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK); d.drawString(nb, 176, 210);
 
     // Input-level meter: snapshot + reset the peak trackers (last ~0.4 s) and
     // render the L/R bars + %/CLIP. Reset so each window reflects recent audio.
     uint16_t lpk = s_uiLpk, rpk = s_uiRpk;
-    s_uiLpk = 0; s_uiRpk = 0;
-    uiMeterRow(MTR_LBY, MTR_LTX, 'L', lpk);
-    uiMeterRow(MTR_RBY, MTR_RTX, 'R', rpk);
+    uint16_t lraw = s_rawLpk, rraw = s_rawRpk;
+    s_uiLpk = 0; s_uiRpk = 0; s_rawLpk = 0; s_rawRpk = 0;
+    uiMeterRow(MTR_LBY, MTR_LTX, 'L', lpk, lraw);
+    uiMeterRow(MTR_RBY, MTR_RTX, 'R', rpk, rraw);
 }
 
 // Dispatch one touch-release at (x,y) based on the current screen.
@@ -1191,8 +1242,9 @@ void audioSourceApplyInputLevel(int level) {
 #endif
 }
 
-// Live stream-mode select (0=RAW/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
-// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono, 7=TURBO/ADPCM-mono). Persisted to NVS,
+// Live stream-mode select (0=SOLID/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
+// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono, 7=TURBO/ADPCM-mono, 8=FINE/Opus-16k-mono).
+// Persisted to NVS,
 // then reboots into the mode (a clean boot per mode is proven stable; a live
 // re-init crashed the encoder). On the classic (non-CoreS3) sender only mode 0
 // is available — Opus needs the CoreS3, and the LITE (6) / TURBO (7) mono
