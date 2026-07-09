@@ -83,12 +83,21 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 // decode + jitter-buffer depth. Table MUST match device-firmware
 // espnow_stream.cpp RX_MODE. See docs/instructions-espnow-modes-button-ui-*.
 //   0 RAW      ADPCM 16k stereo 64-frame(4ms)  pb1  compat/floor (classic+CoreS3)
-//   1 FAST     OPUS   8k mono    40-smp(5ms)    pb1  low-latency
-//   2 BALANCED OPUS   8k mono    40-smp(5ms)    pb1  middle (deeper RX buffer)
+//   1 FAST     OPUS   8k mono    40-smp(5ms)    pb3  low-latency
+//   2 BALANCED OPUS   8k mono    40-smp(5ms)    pb3  middle (deeper RX buffer)
 //   3 SMOOTH   OPUS   8k mono    80-smp(10ms)   pb2  robust (deepest + 2× pb)
-//   4 STEREO   OPUS   8k stereo  80-smp(10ms)   pb1  dual-channel haptics, 8 kHz
+//   4 STEREO   OPUS   8k stereo  80-smp(10ms)   pb2  dual-channel haptics, 8 kHz
 //   5 HIFI     OPUS  16k stereo 160-smp(10ms)   pb2  dual-channel, full 16 kHz band
-//   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb1  zero-encode mono (CoreS3 8k path)
+//   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb3  zero-encode mono (CoreS3 8k path)
+// Per-mode worst-case packet size vs the 250 B ESP-NOW limit (ESP_NOW_MAX_DATA_LEN):
+//   Opus body = type1+mode1+seq1+pbcnt1 + len1 + flen ; each pb entry = seq1+len1+flen.
+//     FAST/BAL  flen=30, pb3: 4 + 1 + 30 + 3*(2+30) = 131 B  <=250 ✓
+//     SMOOTH    flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
+//     STEREO    flen=80, pb2: 4 + 1 + 80 + 2*(2+80) = 249 B  <=250 ✓ (at the limit)
+//     HIFI      flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
+//   ADPCM body = type1+mode1+seq1+pbcnt1 + nf1 + state + data ; each pb entry = seq1+state+data.
+//     RAW  (mode0) 64-frame stereo: state6 + data64, pb1 (unchanged, ~148 B).
+//     LITE (mode6) 8k mono: state3 + data20, pb3: 4 + 1 + 3 + 20 + 3*(1+3+20) = 100 B  <=250 ✓
 // Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only). Mode 6
 // (LITE / ADPCM 8k mono) is also CoreS3-only — its decimate+encode path lives in
 // audioRxTask; the classic loop always ships mode 0 (16 kHz stereo ADPCM).
@@ -106,13 +115,13 @@ struct ModeDef {
     uint8_t  complexity;  // Opus complexity 0-10 (postfilter/tf gates at ≥2/≥5)
 };
 static const ModeDef MODE_DEFS[MODE_COUNT] = {
-    { 0, 16000, 2,   0, 1,     0, 0 },   // 0 RAW      ADPCM 16k stereo
-    { 1,  8000, 1,  40, 1, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms  (c2: low-latency, cheap)
-    { 1,  8000, 1,  40, 1, 48000, 5 },   // 2 BALANCED Opus  8k mono    5 ms
-    { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms
-    { 1,  8000, 2,  80, 1, 64000, 5 },   // 4 STEREO   Opus  8k stereo 10 ms
-    { 1, 16000, 2, 160, 2, 60000, 2 },   // 5 HIFI     Opus 16k stereo 10 ms
-    { 0,  8000, 1,  40, 1,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  (opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
+    { 0, 16000, 2,   0, 1,     0, 0 },   // 0 RAW      ADPCM 16k stereo         pb1 (unchanged)
+    { 1,  8000, 1,  40, 3, 48000, 2 },   // 1 FAST     Opus  8k mono    5 ms  pb3 (131 B; c2: low-latency, cheap)
+    { 1,  8000, 1,  40, 3, 48000, 5 },   // 2 BALANCED Opus  8k mono    5 ms  pb3 (131 B)
+    { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms  pb2 (234 B; pb3 would exceed 250)
+    { 1,  8000, 2,  80, 2, 64000, 5 },   // 4 STEREO   Opus  8k stereo 10 ms  pb2 (249 B, at the 250 limit)
+    { 1, 16000, 2, 160, 2, 60000, 5 },   // 5 HIFI     Opus 16k stereo 10 ms  pb2 (234 B; c5 postfilter — fixes c2 amplitude wobble; verify enc<70% on HW)
+    { 0,  8000, 1,  40, 3,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  pb3 (100 B; opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
 };
 // User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
 // ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz; LITE=zero-encode ADPCM mono).
@@ -463,11 +472,12 @@ static int          s_decim2     = 0;           // 16k→8k 2:1 decimation phase
 static int32_t      s_decim2prev = 0;           // 2-tap average state (mono)
 static int32_t      s_decLprev   = 0;           // 2-tap average state (stereo L)
 static int32_t      s_decRprev   = 0;           // 2-tap average state (stereo R)
-// Opus frame history for piggyback (hist[0]=most recent prev, hist[1]=older).
-static uint8_t      s_opHist[2][OPUS_MAX_LEN];
-static uint8_t      s_opHistLen[2] = {0, 0};
-static uint8_t      s_opHistSeq[2] = {0, 0};
-static int          s_opHistN      = 0;         // valid history entries (0..2)
+// Opus frame history for piggyback: shift-ring of 3 (hist[0]=most recent prev,
+// hist[1]=older, hist[2]=oldest). Depth 3 lets FAST/BALANCED emit up to pb3.
+static uint8_t      s_opHist[3][OPUS_MAX_LEN];
+static uint8_t      s_opHistLen[3] = {0, 0, 0};
+static uint8_t      s_opHistSeq[3] = {0, 0, 0};
+static int          s_opHistN      = 0;         // valid history entries (0..3)
 
 // (Re)configure the Opus encoder for `mode` (1-3). Encoder state lives in
 // INTERNAL SRAM (PSRAM wait states would ~2× the encode time — see gate①).
@@ -526,7 +536,12 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
     if (s_inflight >= STREAM_MAX_INFLIGHT) {
         s_txDroppedBusy++;
     } else {
-        uint8_t pkt[4 + 1 + OPUS_MAX_LEN + 2 * (2 + OPUS_MAX_LEN)];
+        // Static worst-case bound: header(4) + opus_len(1) + frame(<=OPUS_MAX_LEN)
+        // + 3 piggyback entries × [prev_seq(1)+len(1)+data(<=OPUS_MAX_LEN)]. Max
+        // piggyback in MODE_DEFS is now 3, so factor 3: 4+1+160 + 3*(2+160) = 651 B.
+        // The real runtime packet is far smaller (FAST/BAL 131, STEREO 249) and the
+        // >250 guard below rejects anything over ESP-NOW's 250 B limit.
+        uint8_t pkt[4 + 1 + OPUS_MAX_LEN + 3 * (2 + OPUS_MAX_LEN)];
         size_t p = 0;
         pkt[p++] = STREAM_TYPE;
         pkt[p++] = mode;
@@ -553,13 +568,16 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
             else s_txPktSent++;
         }
     }
-    // Record current frame into history (shift) + advance seq — done even on a
-    // busy-drop so the NEXT packet's piggyback can still recover this frame.
+    // Record current frame into history (shift ring of 3) + advance seq — done
+    // even on a busy-drop so the NEXT packet's piggyback can still recover this
+    // frame. Shift: hist[2] <- hist[1] <- hist[0] <- current.
+    memcpy(s_opHist[2], s_opHist[1], s_opHistLen[1]);
+    s_opHistLen[2] = s_opHistLen[1]; s_opHistSeq[2] = s_opHistSeq[1];
     memcpy(s_opHist[1], s_opHist[0], s_opHistLen[0]);
     s_opHistLen[1] = s_opHistLen[0]; s_opHistSeq[1] = s_opHistSeq[0];
     memcpy(s_opHist[0], frame, (size_t)flen);
     s_opHistLen[0] = (uint8_t)flen;  s_opHistSeq[0] = s_seq;
-    if (s_opHistN < 2) s_opHistN++;
+    if (s_opHistN < 3) s_opHistN++;
     s_seq++;
 }
 
@@ -587,22 +605,27 @@ static inline void opusPushSample(int16_t l, int16_t r) {
 // ---- Mono ADPCM encode (mode 6 LITE; CoreS3 8k-mono path) ------------------
 // A zero-encode-CPU sibling to the Opus mono modes: the SAME 8 kHz-mono capture
 // path (downmix + 2:1 decimate), IMA-ADPCM encoded (2 samples/byte) with a
-// depth-1 piggyback (like FAST) so it isolates encode-duty as the FAST-dropout
-// cause. Kept SEPARATE from the stereo mode-0 state (s_sl/s_sr/s_prev_*) so a
-// live mode switch can't cross-corrupt either encoder or its piggyback history.
+// depth-3 piggyback (like FAST) for burst-loss resilience. The lowest-latency
+// mode (no Opus encode/algorithmic delay — measured ~13 ms below FAST). Kept
+// SEPARATE from the stereo mode-0 state (s_sl/s_sr/s_prev_*) so a live mode
+// switch can't cross-corrupt either encoder or its piggyback history.
 static const int  MONO8K_FRAMES = 40;                     // 8k mono samples/packet (5 ms)
 static const int  MONO8K_DBYTES = (MONO8K_FRAMES + 1) / 2;// 20 ADPCM bytes (2 smp/byte)
 static AdpcmState s_sm;                                   // mono encoder state (continuous)
-static bool       s_mono_has_prev = false;
-static uint8_t    s_mono_prev_seq;
-static AdpcmState s_mono_prev_sm;                         // encoder state BEFORE that block
-static uint8_t    s_mono_prev_data[MONO8K_DBYTES];
+// Mono piggyback: shift-ring of 3 (hist[0]=most recent prev … hist[2]=oldest).
+// Each entry = prev_seq(1) + state(pred_lo,pred_hi,step = 3) + data(MONO8K_DBYTES).
+static int        s_monoHistN = 0;                        // valid history entries (0..3)
+static uint8_t    s_monoHistSeq[3];
+static AdpcmState s_monoHistSm[3];                        // encoder state BEFORE each block
+static uint8_t    s_monoHistData[3][MONO8K_DBYTES];
 
 // Encode one 40-sample 8 kHz mono block and broadcast a mode-6 0xAA packet with
-// depth-1 piggyback. Mirrors streamEncodeAndSend()'s in-flight/seq/prev-frame
-// bookkeeping but for the 3-byte mono state (pred int16 LE + step).
+// up to depth-3 piggyback (MODE_DEFS[6].piggyback). Mirrors streamEncodeAndSend()'s
+// in-flight/seq/prev-frame bookkeeping but for the 3-byte mono state (pred int16
+// LE + step).
 // Body: [4]=num_frames(40) [5..7]=state(pred_lo,pred_hi,step) [8..27]=data(20);
-//       then pb× [prev_seq(1)][pred_lo][pred_hi][step][data(20)]. Max 52 B (pb=1).
+//       then pb× [prev_seq(1)][pred_lo][pred_hi][step][data(20)] (oldest first).
+// Max 100 B (pb=3): 4 + 1 + 3 + 20 + 3*(1+3+20).
 static void streamEncodeAndSendMono(const int16_t* mono) {
     // Snapshot encoder state BEFORE this block (goes into the header so the
     // receiver can re-sync per packet).
@@ -621,12 +644,16 @@ static void streamEncodeAndSendMono(const int16_t* mono) {
         return;
     }
 
-    uint8_t pkt[4 + 1 + 3 + MONO8K_DBYTES + (1 + 3 + MONO8K_DBYTES)];
+    // pb entries this packet = min(configured depth, valid history).
+    int depth = MODE_DEFS[MODE_MONO8K].piggyback;
+    int pbn   = s_monoHistN < depth ? s_monoHistN : depth;
+
+    uint8_t pkt[4 + 1 + 3 + MONO8K_DBYTES + 3 * (1 + 3 + MONO8K_DBYTES)];
     size_t  pkt_len = 0;
     pkt[pkt_len++] = STREAM_TYPE;
     pkt[pkt_len++] = MODE_MONO8K;
     pkt[pkt_len++] = s_seq;
-    pkt[pkt_len++] = s_mono_has_prev ? 1 : 0;         // pb_count
+    pkt[pkt_len++] = (uint8_t)pbn;                    // pb_count
     pkt[pkt_len++] = (uint8_t)MONO8K_FRAMES;          // num_frames (mono samples)
     pkt[pkt_len++] = (uint8_t)(pre_m.predictor & 0xFF);
     pkt[pkt_len++] = (uint8_t)((pre_m.predictor >> 8) & 0xFF);
@@ -634,12 +661,13 @@ static void streamEncodeAndSendMono(const int16_t* mono) {
     memcpy(pkt + pkt_len, data, MONO8K_DBYTES);
     pkt_len += MONO8K_DBYTES;
 
-    if (s_mono_has_prev) {
-        pkt[pkt_len++] = s_mono_prev_seq;
-        pkt[pkt_len++] = (uint8_t)(s_mono_prev_sm.predictor & 0xFF);
-        pkt[pkt_len++] = (uint8_t)((s_mono_prev_sm.predictor >> 8) & 0xFF);
-        pkt[pkt_len++] = s_mono_prev_sm.step_index;
-        memcpy(pkt + pkt_len, s_mono_prev_data, MONO8K_DBYTES);
+    // piggyback: previous pbn frames, OLDEST first (seq order for decode).
+    for (int h = pbn - 1; h >= 0; h--) {
+        pkt[pkt_len++] = s_monoHistSeq[h];
+        pkt[pkt_len++] = (uint8_t)(s_monoHistSm[h].predictor & 0xFF);
+        pkt[pkt_len++] = (uint8_t)((s_monoHistSm[h].predictor >> 8) & 0xFF);
+        pkt[pkt_len++] = s_monoHistSm[h].step_index;
+        memcpy(pkt + pkt_len, s_monoHistData[h], MONO8K_DBYTES);
         pkt_len += MONO8K_DBYTES;
     }
 
@@ -650,10 +678,14 @@ static void streamEncodeAndSendMono(const int16_t* mono) {
         s_txSendFail++;
     } else {
         s_txPktSent++;
-        s_mono_has_prev = true;
-        s_mono_prev_seq = s_seq;
-        s_mono_prev_sm  = pre_m;
-        memcpy(s_mono_prev_data, data, MONO8K_DBYTES);
+        // Record this frame into history (shift ring of 3, newest at [0]).
+        s_monoHistSeq[2] = s_monoHistSeq[1]; s_monoHistSm[2] = s_monoHistSm[1];
+        memcpy(s_monoHistData[2], s_monoHistData[1], MONO8K_DBYTES);
+        s_monoHistSeq[1] = s_monoHistSeq[0]; s_monoHistSm[1] = s_monoHistSm[0];
+        memcpy(s_monoHistData[1], s_monoHistData[0], MONO8K_DBYTES);
+        s_monoHistSeq[0] = s_seq; s_monoHistSm[0] = pre_m;
+        memcpy(s_monoHistData[0], data, MONO8K_DBYTES);
+        if (s_monoHistN < 3) s_monoHistN++;
     }
     s_seq++;
 }
@@ -707,7 +739,7 @@ static void audioRxTask(void* /*arg*/) {
                         opusEncoderConfig(mode);        // Opus modes (1-5): (re)configure encoder
                     } else if (mode == MODE_MONO8K) {
                         adpcmStateInit(&s_sm);          // fresh mono encoder state
-                        s_mono_has_prev = false;        // drop stale mono piggyback
+                        s_monoHistN = 0;                // drop stale mono piggyback
                     }
                     taskMode = mode;
                 }
