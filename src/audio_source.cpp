@@ -88,10 +88,13 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //   3 SMOOTH   OPUS   8k mono    80-smp(10ms)   pb2  robust (deepest + 2× pb)
 //   4 STEREO   OPUS   8k stereo  80-smp(10ms)   pb1  dual-channel haptics, 8 kHz
 //   5 HIFI     OPUS  16k stereo 160-smp(10ms)   pb2  dual-channel, full 16 kHz band
-// Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only).
+//   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb1  zero-encode mono (CoreS3 8k path)
+// Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only). Mode 6
+// (LITE / ADPCM 8k mono) is also CoreS3-only — its decimate+encode path lives in
+// audioRxTask; the classic loop always ships mode 0 (16 kHz stereo ADPCM).
 enum StreamMode : uint8_t {
     MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3,
-    MODE_STEREO = 4, MODE_HIFI = 5, MODE_COUNT = 6
+    MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_COUNT = 7
 };
 struct ModeDef {
     uint8_t  codec;       // 0 = ADPCM, 1 = OPUS
@@ -109,18 +112,20 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 1,  8000, 1,  80, 2, 60000, 5 },   // 3 SMOOTH   Opus  8k mono   10 ms
     { 1,  8000, 2,  80, 1, 64000, 5 },   // 4 STEREO   Opus  8k stereo 10 ms
     { 1, 16000, 2, 160, 2, 60000, 2 },   // 5 HIFI     Opus 16k stereo 10 ms
+    { 0,  8000, 1,  40, 1,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  (opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
 };
 // User-facing names (RAW=ADPCM baseline; FAST/BALANCED/SMOOTH=Opus mono latency
-// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz).
+// ladder; STEREO/HIFI=dual-channel Opus at 8/16 kHz; LITE=zero-encode ADPCM mono).
 static const char*   MODE_NAME[MODE_COUNT] = { "RAW", "FAST", "BALANCED",
-                                               "SMOOTH", "STEREO", "HIFI" };
+                                               "SMOOTH", "STEREO", "HIFI", "LITE" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
                                                "Opus 15ms", "Opus 28ms",
-                                               "Opus 18ms", "Opus 28ms" };
+                                               "Opus 18ms", "Opus 28ms", "ADPCM 8ms" };
 // Audio format per mode (rate + channels), shown on the sender HOME screen.
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
                                                "8kHz Mono", "8kHz Mono",
-                                               "8kHz Stereo", "16kHz Stereo" };
+                                               "8kHz Stereo", "16kHz Stereo",
+                                               "8kHz Mono ADPCM" };
 static const int      OPUS_MAX_LEN         = 160;    // max opus frame bytes (headroom)
 static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
 // s_opusAccum is [OPUS_MAX_SMP*2] (per-channel × up to 2 ch). Guard that the
@@ -579,10 +584,88 @@ static inline void opusPushSample(int16_t l, int16_t r) {
     }
 }
 
+// ---- Mono ADPCM encode (mode 6 LITE; CoreS3 8k-mono path) ------------------
+// A zero-encode-CPU sibling to the Opus mono modes: the SAME 8 kHz-mono capture
+// path (downmix + 2:1 decimate), IMA-ADPCM encoded (2 samples/byte) with a
+// depth-1 piggyback (like FAST) so it isolates encode-duty as the FAST-dropout
+// cause. Kept SEPARATE from the stereo mode-0 state (s_sl/s_sr/s_prev_*) so a
+// live mode switch can't cross-corrupt either encoder or its piggyback history.
+static const int  MONO8K_FRAMES = 40;                     // 8k mono samples/packet (5 ms)
+static const int  MONO8K_DBYTES = (MONO8K_FRAMES + 1) / 2;// 20 ADPCM bytes (2 smp/byte)
+static AdpcmState s_sm;                                   // mono encoder state (continuous)
+static bool       s_mono_has_prev = false;
+static uint8_t    s_mono_prev_seq;
+static AdpcmState s_mono_prev_sm;                         // encoder state BEFORE that block
+static uint8_t    s_mono_prev_data[MONO8K_DBYTES];
+
+// Encode one 40-sample 8 kHz mono block and broadcast a mode-6 0xAA packet with
+// depth-1 piggyback. Mirrors streamEncodeAndSend()'s in-flight/seq/prev-frame
+// bookkeeping but for the 3-byte mono state (pred int16 LE + step).
+// Body: [4]=num_frames(40) [5..7]=state(pred_lo,pred_hi,step) [8..27]=data(20);
+//       then pb× [prev_seq(1)][pred_lo][pred_hi][step][data(20)]. Max 52 B (pb=1).
+static void streamEncodeAndSendMono(const int16_t* mono) {
+    // Snapshot encoder state BEFORE this block (goes into the header so the
+    // receiver can re-sync per packet).
+    AdpcmState pre_m = s_sm;
+
+    // Always encode (advances state) even if we then drop, so the next packet's
+    // header reflects the correct predictor state.
+    uint8_t data[MONO8K_DBYTES];
+    adpcmEncodeBlockMono(mono, data, MONO8K_FRAMES, &s_sm);
+
+    // In-flight cap: drop if too many unacknowledged sends; bump seq so the
+    // receiver sees a gap (handled as loss) rather than corruption.
+    if (s_inflight >= STREAM_MAX_INFLIGHT) {
+        s_txDroppedBusy++;
+        s_seq++;
+        return;
+    }
+
+    uint8_t pkt[4 + 1 + 3 + MONO8K_DBYTES + (1 + 3 + MONO8K_DBYTES)];
+    size_t  pkt_len = 0;
+    pkt[pkt_len++] = STREAM_TYPE;
+    pkt[pkt_len++] = MODE_MONO8K;
+    pkt[pkt_len++] = s_seq;
+    pkt[pkt_len++] = s_mono_has_prev ? 1 : 0;         // pb_count
+    pkt[pkt_len++] = (uint8_t)MONO8K_FRAMES;          // num_frames (mono samples)
+    pkt[pkt_len++] = (uint8_t)(pre_m.predictor & 0xFF);
+    pkt[pkt_len++] = (uint8_t)((pre_m.predictor >> 8) & 0xFF);
+    pkt[pkt_len++] = pre_m.step_index;
+    memcpy(pkt + pkt_len, data, MONO8K_DBYTES);
+    pkt_len += MONO8K_DBYTES;
+
+    if (s_mono_has_prev) {
+        pkt[pkt_len++] = s_mono_prev_seq;
+        pkt[pkt_len++] = (uint8_t)(s_mono_prev_sm.predictor & 0xFF);
+        pkt[pkt_len++] = (uint8_t)((s_mono_prev_sm.predictor >> 8) & 0xFF);
+        pkt[pkt_len++] = s_mono_prev_sm.step_index;
+        memcpy(pkt + pkt_len, s_mono_prev_data, MONO8K_DBYTES);
+        pkt_len += MONO8K_DBYTES;
+    }
+
+    s_inflight++;
+    esp_err_t send_err = esp_now_send(BROADCAST_MAC, pkt, pkt_len);
+    if (send_err != ESP_OK) {
+        s_inflight--;
+        s_txSendFail++;
+    } else {
+        s_txPktSent++;
+        s_mono_has_prev = true;
+        s_mono_prev_seq = s_seq;
+        s_mono_prev_sm  = pre_m;
+        memcpy(s_mono_prev_data, data, MONO8K_DBYTES);
+    }
+    s_seq++;
+}
+
 // ---- CoreS3 capture task: raw i2s_read (small chunks) → FIR decimate → send -
 static void audioRxTask(void* /*arg*/) {
-    static int16_t accum[FRAMES_PKT * 2];   // 16 kHz stereo, one ADPCM packet
+    static int16_t accum[FRAMES_PKT * 2];   // 16 kHz stereo, one ADPCM packet (mode 0)
     int accumIdx = 0;
+    static int16_t monoAccum[MONO8K_FRAMES]; // 8 kHz mono, one ADPCM packet (mode 6)
+    int monoAccumN = 0;
+    int monoDecPhase = 0;                    // 16k→8k 2:1 decimation phase (mode 6)
+    int32_t monoDecPrev = 0;                 // 2-tap average state (mode 6, distinct from s_decim2)
     uint32_t dcount = 0;
     uint8_t taskMode = 0xFF;                 // detect live mode switches
     static int16_t rx[FRAMES_PKT * 2];      // read chunk (64 stereo frames)
@@ -615,14 +698,34 @@ static void audioRxTask(void* /*arg*/) {
                 // Route by the (live-switchable) stream mode.
                 uint8_t mode = s_mode;
                 if (mode != taskMode) {
-                    accumIdx = 0;
-                    if (mode >= MODE_L) opusEncoderConfig(mode);
+                    // Reset per-mode accumulation so a live switch never carries a
+                    // partial block or stale piggyback into the new mode.
+                    accumIdx = 0;                       // stereo ADPCM (mode 0) block
+                    monoAccumN = 0;                     // mono ADPCM  (mode 6) block
+                    monoDecPhase = 0;                   // mono 16k→8k decimation phase
+                    if (MODE_DEFS[mode].codec == 1) {
+                        opusEncoderConfig(mode);        // Opus modes (1-5): (re)configure encoder
+                    } else if (mode == MODE_MONO8K) {
+                        adpcmStateInit(&s_sm);          // fresh mono encoder state
+                        s_mono_has_prev = false;        // drop stale mono piggyback
+                    }
                     taskMode = mode;
                 }
                 if (mode == MODE_ADPCM) {
                     accum[accumIdx * 2]     = (int16_t)l;
                     accum[accumIdx * 2 + 1] = (int16_t)r;
                     if (++accumIdx >= FRAMES_PKT) { streamEncodeAndSend(accum); accumIdx = 0; }
+                } else if (mode == MODE_MONO8K) {
+                    // 8 kHz mono ADPCM (LITE): downmix + 2:1 decimate 16k stereo → 8k
+                    // mono (same as the 8k-mono Opus path), then pack 40 samples
+                    // (5 ms) into one mode-6 ADPCM packet.
+                    int32_t mono16 = ((int32_t)l + r) / 2;
+                    if (monoDecPhase == 0) { monoDecPrev = mono16; monoDecPhase = 1; }
+                    else {
+                        monoDecPhase = 0;
+                        monoAccum[monoAccumN++] = (int16_t)((monoDecPrev + mono16) / 2);
+                        if (monoAccumN >= MONO8K_FRAMES) { streamEncodeAndSendMono(monoAccum); monoAccumN = 0; }
+                    }
                 } else if (MODE_DEFS[mode].rate >= 16000) {
                     // 16 kHz Opus: no decimation. Stereo keeps L/R; mono downmixes.
                     if (MODE_DEFS[mode].channels == 2)
@@ -728,6 +831,7 @@ void audioSourceSetup() {
     }
 
     firInit();
+    adpcmStateInit(&s_sm);   // mono ADPCM encoder state (mode 6 LITE); s_sl/s_sr done above
     // Raw RX-only I2S with small DMA buffers (switch-A SCLK/MCLK pins).
     i2sRxInit(mck, bck, ws, s_i2s_din);
 
@@ -766,6 +870,12 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
     d.setTextDatum(textdatum_t::top_left);
 }
 
+// The touch grid renders ONLY modes 0-5 (a fixed 3×2 layout). Mode 6 (LITE) is
+// serial-selectable via `set_stream_mode 6` until the Phase-2 ADPCM/Opus
+// hierarchy UI lands. This cap decouples the grid from MODE_COUNT so bumping
+// MODE_COUNT to 7 does NOT overflow the 6 cells (a 4th row would run off-screen).
+static const int UI_GRID_MODE_COUNT = 6;
+
 // MODE-select 3×2 grid geometry — row-major RAW|FAST / BALANCED|SMOOTH /
 // STEREO|HIFI (i = row*2 + col). Larger cells than the old 6-row list to stop
 // mis-taps. 3 rows fit the 240 px height (y0 42 + 2×64 + 58 = 228 < 240).
@@ -799,7 +909,7 @@ static void uiRepaint() {
     } else if (s_ui == UI_MODE) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT MODE", 6, 6);
-        for (int i = 0; i < MODE_COUNT; i++) {
+        for (int i = 0; i < UI_GRID_MODE_COUNT; i++) {
             int col = i & 1, row = i >> 1;
             int x = UI_MODE_X0 + col * UI_MODE_COLP;
             int y = UI_MODE_Y0 + row * UI_MODE_ROWP;
@@ -862,7 +972,7 @@ static void uiTouch(int x, int y) {
         int cy = y - (UI_MODE_Y0 + row * UI_MODE_ROWP);
         if (cx >= UI_MODE_COLW || cy < 0 || cy >= UI_MODE_CELLH) return;
         int i = row * 2 + col;
-        if (i >= 0 && i < MODE_COUNT) audioSourceSetMode(i);        // saves NVS + reboots
+        if (i >= 0 && i < UI_GRID_MODE_COUNT) audioSourceSetMode(i);  // saves NVS + reboots
     } else {  // UI_CH
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
         if (y >= 90 && y <= 152) {
@@ -937,9 +1047,11 @@ void audioSourceApplyInputLevel(int level) {
 }
 
 // Live stream-mode select (0=RAW/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
-// 4=STEREO, 5=HIFI). Persisted to NVS, then reboots into the mode (a clean boot
-// per mode is proven stable; a live re-init crashed the encoder). On the classic
-// (non-CoreS3) sender only ADPCM (0) is available — Opus needs the CoreS3.
+// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono). Persisted to NVS, then reboots into the
+// mode (a clean boot per mode is proven stable; a live re-init crashed the
+// encoder). On the classic (non-CoreS3) sender only mode 0 is available — Opus
+// needs the CoreS3, and the LITE (6) mono decimate/encode path also lives in the
+// CoreS3-only audioRxTask (the classic loop always ships mode 0).
 void audioSourceSetMode(int mode) {
     if (mode < 0 || mode >= MODE_COUNT) return;
 #ifndef BOARD_CORES3

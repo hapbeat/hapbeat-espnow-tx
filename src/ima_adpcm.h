@@ -28,4 +28,11 @@ void adpcmEncodeBlockStereo(const int16_t* input, uint8_t* output,
                             size_t num_frames,
                             AdpcmState* state_l, AdpcmState* state_r);
 
+// Encode a block of mono PCM16 to ADPCM (2 samples/byte: low nibble = sample N,
+// high nibble = sample N+1). num_samples samples → ceil(num_samples/2) bytes.
+// Byte-identical to the receiver's adpcmDecodeBlockMono unpacking
+// (hapbeat-device-firmware) — used by mode 6 LITE.
+void adpcmEncodeBlockMono(const int16_t* input, uint8_t* output,
+                          size_t num_samples, AdpcmState* state);
+
 #endif // IMA_ADPCM_H

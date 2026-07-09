@@ -186,7 +186,7 @@ static void handleLine(const char* line) {
         return;
     }
 
-    // ---- set_stream_mode (0=ADPCM,1=L,2=M,3=Q) -----------------------------
+    // ---- set_stream_mode (0=RAW,1=FAST,2=BALANCED,3=SMOOTH,4=STEREO,5=HIFI,6=LITE) --
     if (strcmp(cmd, "set_stream_mode") == 0) {
         int m = doc["mode"] | 0;
 #ifdef AUDIO_SOURCE

@@ -77,3 +77,15 @@ void adpcmEncodeBlockStereo(const int16_t* input, uint8_t* output,
         output[i] = (hi << 4) | (lo & 0x0F);
     }
 }
+
+void adpcmEncodeBlockMono(const int16_t* input, uint8_t* output,
+                          size_t num_samples, AdpcmState* state) {
+    for (size_t i = 0; i < num_samples; i += 2) {
+        uint8_t lo = adpcmEncodeSample(input[i], state);
+        uint8_t hi = 0;
+        if (i + 1 < num_samples) {
+            hi = adpcmEncodeSample(input[i + 1], state);
+        }
+        output[i / 2] = (hi << 4) | (lo & 0x0F);
+    }
+}
