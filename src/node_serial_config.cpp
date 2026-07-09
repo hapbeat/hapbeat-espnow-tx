@@ -113,11 +113,15 @@ static void handleLine(const char* line) {
         p.begin("espnow", true);
         r["espnow_channel"] = p.getUChar("channel", 1);
 
-        // relay_src: report as MAC string if set
+        // relay_src: MAC string when pinned, null when auto origin-follow
+        // (DEC-043). An all-zero stored MAC = auto, reported as null.
         uint8_t relay_mac[6] = {};
-        size_t mac_len = p.getBytesLength("relay_src");
-        if (mac_len == 6) {
+        bool pinned = false;
+        if (p.getBytesLength("relay_src") == 6) {
             p.getBytes("relay_src", relay_mac, 6);
+            for (int i = 0; i < 6; i++) if (relay_mac[i]) { pinned = true; break; }
+        }
+        if (pinned) {
             char mac_str[18];
             macToStr(relay_mac, mac_str, sizeof(mac_str));
             r["relay_src"] = mac_str;
@@ -186,7 +190,7 @@ static void handleLine(const char* line) {
         return;
     }
 
-    // ---- set_stream_mode (0=RAW,1=FAST,2=BALANCED,3=SMOOTH,4=STEREO,5=HIFI,6=LITE) --
+    // ---- set_stream_mode (0=SOLID..8=FINE; see espnow-stream.md §3.4) --
     if (strcmp(cmd, "set_stream_mode") == 0) {
         int m = doc["mode"] | 0;
 #ifdef AUDIO_SOURCE
