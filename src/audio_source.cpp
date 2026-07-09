@@ -854,7 +854,7 @@ void audioSourceSetup() {
 // HOME shows the current mode + channel + live stats and two buttons. Tapping a
 // button drills into a full-screen selector; tapping the header returns. Mode /
 // channel changes reboot into the new setting (see audioSourceSetMode).
-enum { UI_HOME = 0, UI_MODE = 1, UI_CH = 2 };
+enum { UI_HOME = 0, UI_FAMILY = 1, UI_MODE = 2, UI_CH = 3 };
 static uint8_t s_ui      = UI_HOME;
 static bool    s_uiDirty = true;              // force a full repaint on screen change
 static const uint16_t UI_SEL_BG = 0x0208;     // dark-cyan fill behind a selected item
@@ -870,11 +870,23 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
     d.setTextDatum(textdatum_t::top_left);
 }
 
-// The touch grid renders ONLY modes 0-5 (a fixed 3×2 layout). Mode 6 (LITE) is
-// serial-selectable via `set_stream_mode 6` until the Phase-2 ADPCM/Opus
-// hierarchy UI lands. This cap decouples the grid from MODE_COUNT so bumping
-// MODE_COUNT to 7 does NOT overflow the 6 cells (a 4th row would run off-screen).
-static const int UI_GRID_MODE_COUNT = 6;
+// ---- Two-level mode picker: family (ADPCM / OPUS) -> mode within it --------
+// The wire mode_id is unchanged; this only groups the on-screen selector so the
+// 3x2 grid never needs a 4th row (ADPCM has 2 modes, OPUS has 5 — both fit).
+enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_COUNT = 2 };
+static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS" };
+static const char* const FAM_HINT[FAM_COUNT] = { "low latency", "quality" };
+static const uint8_t FAM_ADPCM_MODES[] = { MODE_ADPCM, MODE_MONO8K };                 // RAW, LITE
+static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_STEREO, MODE_HIFI };
+struct FamilyDef { const uint8_t* modes; uint8_t count; };
+static const FamilyDef FAMILY[FAM_COUNT] = {
+    { FAM_ADPCM_MODES, 2 },
+    { FAM_OPUS_MODES,  5 },
+};
+static inline uint8_t familyOf(uint8_t mode) {
+    return (mode == MODE_ADPCM || mode == MODE_MONO8K) ? FAM_ADPCM : FAM_OPUS;
+}
+static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
 
 // MODE-select 3×2 grid geometry — row-major RAW|FAST / BALANCED|SMOOTH /
 // STEREO|HIFI (i = row*2 + col). Larger cells than the old 6-row list to stop
@@ -906,22 +918,43 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.drawString(MODE_FMT[m], 8, 120);
         uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
         uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
+    } else if (s_ui == UI_FAMILY) {
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
+        uint8_t curFam = familyOf(m);
+        for (int f = 0; f < FAM_COUNT; f++) {
+            int x = 10 + f * 160, y = 54, w = 140, h = 150;
+            bool cur = (f == curFam);
+            uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
+            if (cur) d.fillRoundRect(x, y, w, h, 8, UI_SEL_BG);
+            d.drawRoundRect(x, y, w, h, 8, cur ? TFT_CYAN : TFT_DARKCYAN);
+            d.setTextDatum(textdatum_t::middle_center);
+            d.setTextSize(3); d.setTextColor(cur ? TFT_WHITE : TFT_CYAN, bg);
+            d.drawString(FAM_NAME[f], x + w / 2, y + h / 2 - 14);
+            d.setTextSize(1); d.setTextColor(TFT_DARKGREY, bg);
+            d.drawString(FAM_HINT[f], x + w / 2, y + h / 2 + 16);
+        }
+        d.setTextDatum(textdatum_t::top_left);
     } else if (s_ui == UI_MODE) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
-        d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT MODE", 6, 6);
-        for (int i = 0; i < UI_GRID_MODE_COUNT; i++) {
+        d.setTextDatum(textdatum_t::top_left);
+        char hdr[24]; snprintf(hdr, sizeof(hdr), "< %s", FAM_NAME[s_uiFamily]);
+        d.drawString(hdr, 6, 6);
+        const FamilyDef& fam = FAMILY[s_uiFamily];
+        for (int i = 0; i < fam.count; i++) {
+            uint8_t mode = fam.modes[i];
             int col = i & 1, row = i >> 1;
             int x = UI_MODE_X0 + col * UI_MODE_COLP;
             int y = UI_MODE_Y0 + row * UI_MODE_ROWP;
-            bool cur = (i == m);
+            bool cur = (mode == m);
             uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
             if (cur) d.fillRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, UI_SEL_BG);
             d.drawRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, cur ? TFT_CYAN : TFT_DARKGREY);
             d.setTextDatum(textdatum_t::top_left);
             d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, bg);
-            d.drawString(MODE_NAME[i], x + 10, y + 8);
+            d.drawString(MODE_NAME[mode], x + 10, y + 8);
             d.setTextSize(1); d.setTextColor(TFT_DARKGREY, bg);
-            d.drawString(MODE_DESC[i], x + 10, y + 38);
+            d.drawString(MODE_DESC[mode], x + 10, y + 38);
         }
         d.setTextDatum(textdatum_t::top_left);
     } else {  // UI_CH
@@ -960,9 +993,17 @@ static void uiUpdateHome() {
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
     if (s_ui == UI_HOME) {
-        if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_MODE : UI_CH; s_uiDirty = true; }
+        if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
+    } else if (s_ui == UI_FAMILY) {
+        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
+        if (y >= 54 && y <= 204) {                                  // two family cells
+            int f = -1;
+            if (x >= 10 && x < 150)       f = FAM_ADPCM;
+            else if (x >= 170 && x < 310) f = FAM_OPUS;
+            if (f >= 0) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; }
+        }
     } else if (s_ui == UI_MODE) {
-        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back
+        if (y < 36) { s_ui = UI_FAMILY; s_uiDirty = true; return; } // header = back to family
         if (x < UI_MODE_X0) return;                                 // left of the grid
         int col = (x - UI_MODE_X0) / UI_MODE_COLP;
         int row = (y - UI_MODE_Y0) / UI_MODE_ROWP;
@@ -972,7 +1013,8 @@ static void uiTouch(int x, int y) {
         int cy = y - (UI_MODE_Y0 + row * UI_MODE_ROWP);
         if (cx >= UI_MODE_COLW || cy < 0 || cy >= UI_MODE_CELLH) return;
         int i = row * 2 + col;
-        if (i >= 0 && i < UI_GRID_MODE_COUNT) audioSourceSetMode(i);  // saves NVS + reboots
+        const FamilyDef& fam = FAMILY[s_uiFamily];
+        if (i >= 0 && i < fam.count) audioSourceSetMode(fam.modes[i]);  // saves NVS + reboots
     } else {  // UI_CH
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
         if (y >= 90 && y <= 152) {
