@@ -42,6 +42,10 @@
 #include <Preferences.h>
 #include <cstring>
 #include <cstdio>
+#ifdef BOARD_XIAO_C6
+#include <Wire.h>
+#include <U8x8lib.h>   // Seeed XIAO Expansion Board 0.96" OLED (SSD1306 128x64)
+#endif
 
 static const uint8_t  STREAM_TYPE         = 0xAA;   // audio stream packet
 static const uint8_t  FLEET_TYPE          = 0xAC;   // fleet-tune beacon (§3.5, 4 B)
@@ -66,6 +70,12 @@ static uint8_t s_channel = 1;   // for display / heartbeat
 static volatile uint32_t s_relayed    = 0;    // packets successfully re-broadcast
 static volatile uint32_t s_slot_drops = 0;    // dropped because the ring was full
 static volatile int8_t   s_origin_rssi = 127; // last origin RSSI (IDF5 recv adapter); 127 = n/a
+static volatile uint8_t  s_last_mode   = 0xFF; // mode_id of the last relayed 0xAA stream (0xFF = none)
+
+// Compact mode-name table for the XIAO expansion-board OLED. Index = mode_id,
+// matching the receiver STREAM_MODE_NAME / sender MODE_NAME order.
+static const char* const RPT_MODE_NAME[9] = {
+    "SOLID", "FAST", "BALANCED", "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO", "FINE" };
 
 // ---- 4-slot SPSC ring (lock-free, single producer = callback) --------------
 static const int SLOT_COUNT = 4;
@@ -102,6 +112,8 @@ static void onReceiveCbBody(const uint8_t* src, const uint8_t* data, int len) {
         }
         s_origin_last_ms = millis();
     }
+
+    if (is_stream) s_last_mode = data[1] & 0x7F;   // relayed-stream mode for the OLED
 
     // Enqueue into the SPSC ring. Set RELAYED (bit7) on the copy — the ONLY byte
     // changed; seq/body/piggyback are verbatim (receiver piggyback matches
@@ -150,16 +162,72 @@ static inline void xiaoLedSet(bool on) {
     digitalWrite(LED_BUILTIN, on ? XIAO_LED_ON : XIAO_LED_OFF);
 }
 
+// Seeed XIAO Expansion Board OLED (SSD1306 128x64 @ 0x3C, I2C SDA=22 / SCL=23).
+// Auto-detected at boot — a bare XIAO (no expansion board) simply skips it. Shows
+// channel / origin / relayed rate / relayed-stream mode so an operator can read a
+// repeater's settings at a glance (esp. that its channel matches the fleet).
+static U8X8_SSD1306_128X64_NONAME_HW_I2C s_oled(U8X8_PIN_NONE, SCL, SDA);
+static bool s_has_oled = false;
+
+static void xiaoOledInit() {
+    Wire.begin(SDA, SCL);
+    Wire.beginTransmission(0x3C);
+    s_has_oled = (Wire.endTransmission() == 0);   // ACK → expansion board present
+    if (!s_has_oled) { Serial.println("[REPEATER] XIAO: no expansion OLED (0x3C)"); return; }
+    s_oled.begin();
+    s_oled.setFont(u8x8_font_chroma48medium8_r);
+    s_oled.clear();
+    s_oled.drawString(0, 0, "HAPBEAT RPT");
+    Serial.println("[REPEATER] XIAO: expansion OLED found (SSD1306 0x3C)");
+}
+
+// ~2 Hz status refresh. drawString does not clear, so every field is space-padded
+// to overwrite the previous value (no full clear → no flicker).
+static void xiaoOledDraw() {
+    if (!s_has_oled) return;
+    static uint32_t s_last = 0, s_last_relayed = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - s_last) < 500) return;
+    uint32_t dt = now - s_last; s_last = now;
+    uint32_t pps = dt ? (uint32_t)((uint64_t)(s_relayed - s_last_relayed) * 1000 / dt) : 0;
+    s_last_relayed = s_relayed;
+
+    char line[20];
+    snprintf(line, sizeof(line), "ch:%-2u  pin:%d   ", s_channel, s_pin_active ? 1 : 0);
+    s_oled.drawString(0, 1, line);
+    if (s_pin_active || s_origin_locked) {
+        const uint8_t* o = s_pin_active ? s_relay_src : s_origin;
+        snprintf(line, sizeof(line), "org:%02X%02X       ", o[4], o[5]);
+    } else {
+        snprintf(line, sizeof(line), "org:none       ");
+    }
+    s_oled.drawString(0, 2, line);
+    uint8_t md = s_last_mode;
+    snprintf(line, sizeof(line), "mode:%-8s ", (md < 9) ? RPT_MODE_NAME[md] : "--");
+    s_oled.drawString(0, 3, line);
+    snprintf(line, sizeof(line), "rly:%lu/s        ", (unsigned long)(pps > 9999 ? 9999 : pps));
+    s_oled.drawString(0, 4, line);
+    snprintf(line, sizeof(line), "drop:%lu          ", (unsigned long)(s_slot_drops > 99999 ? 99999 : s_slot_drops));
+    s_oled.drawString(0, 5, line);
+    if (s_origin_rssi != 127) {
+        snprintf(line, sizeof(line), "rssi:%-4d       ", (int)s_origin_rssi);
+        s_oled.drawString(0, 6, line);
+    }
+}
+
 static void xiaoUiSetup() {
     // Select the external u.FL antenna (better range for a coverage repeater).
     pinMode(WIFI_ENABLE, OUTPUT);      digitalWrite(WIFI_ENABLE, LOW);       // enable RF switch
     pinMode(WIFI_ANT_CONFIG, OUTPUT);  digitalWrite(WIFI_ANT_CONFIG, HIGH);  // external antenna
     pinMode(XIAO_BOOT_PIN, INPUT_PULLUP);
     pinMode(LED_BUILTIN, OUTPUT);      xiaoLedSet(false);
+    xiaoOledInit();                    // optional expansion-board status OLED
     Serial.println("[REPEATER] XIAO C6: external antenna, BOOT=ch-cycle");
 }
 
 static void xiaoUiLoop(uint32_t now) {
+    xiaoOledDraw();                    // always refreshes (runs before the LED early-return)
+
     // BOOT short-press cycles the ESP-NOW channel 1 -> 6 -> 11 (persisted + live).
     static bool     prev_down = false;
     static uint32_t press_at  = 0;
@@ -259,9 +327,10 @@ void repeaterLoop() {
         char rssi_str[8];
         if (s_origin_rssi == 127) snprintf(rssi_str, sizeof(rssi_str), "n/a");
         else                      snprintf(rssi_str, sizeof(rssi_str), "%d", (int)s_origin_rssi);
-        Serial.printf("[RPT] relayed/s=%u drops=%u origin=%s pin=%d rssi=%s\n",
-                      (unsigned)(d / (HEARTBEAT_MS / 1000)), (unsigned)s_slot_drops,
-                      origin_str, s_pin_active ? 1 : 0, rssi_str);
+        const char* md = (s_last_mode < 9) ? RPT_MODE_NAME[s_last_mode] : "--";
+        Serial.printf("[RPT] ch=%u relayed/s=%u drops=%u origin=%s pin=%d mode=%s rssi=%s\n",
+                      s_channel, (unsigned)(d / (HEARTBEAT_MS / 1000)), (unsigned)s_slot_drops,
+                      origin_str, s_pin_active ? 1 : 0, md, rssi_str);
     }
 
 #ifndef BOARD_XIAO_C6
