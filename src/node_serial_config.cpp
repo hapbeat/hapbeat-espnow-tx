@@ -113,7 +113,7 @@ static void handleLine(const char* line) {
 
         Preferences p;
         p.begin("espnow", true);
-        r["espnow_channel"] = p.getUChar("channel", 1);
+        r["espnow_channel"] = p.getUChar("channel", 11);   // NVS-empty default (= config.h ESPNOW_CHANNEL)
 
         // relay_src: MAC string when pinned, null when auto origin-follow
         // (DEC-043). An all-zero stored MAC = auto, reported as null.

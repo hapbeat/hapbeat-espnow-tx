@@ -959,7 +959,7 @@ void audioSourceSetup() {
     {
         Preferences p;
         p.begin("espnow", true);
-        s_channel = p.getUChar("channel", 1);
+        s_channel = p.getUChar("channel", ESPNOW_CHANNEL);   // default matches the radio (config.h)
         p.end();
         p.begin("tx", true);
         s_input_level = p.getInt("input_level", 50);

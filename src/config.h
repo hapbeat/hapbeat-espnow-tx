@@ -19,7 +19,12 @@ static constexpr uint8_t END_MARKER   = 0x55;
 static constexpr uint8_t FRAME_HEADER_SIZE = 6;
 
 // ESP-NOW
-static constexpr uint8_t ESPNOW_CHANNEL = 1;
+// Default channel (NVS-empty fallback for TX + repeater). 11 is an edge channel
+// (one-sided adjacent interference, like ch1) and statistically a bit less
+// crowded than 1/6 (common router defaults) — venue-dependent, always confirm
+// per site. MUST match the RECEIVER's ESPNOW_DEFAULT_CHANNEL (device-firmware)
+// so a clean flash of the whole fleet comes up on one channel (user 2026-07-11).
+static constexpr uint8_t ESPNOW_CHANNEL = 11;
 static const uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // Command types received from Bridge

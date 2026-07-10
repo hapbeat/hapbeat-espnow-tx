@@ -64,7 +64,7 @@ static uint8_t s_origin[6] = {};
 static volatile bool     s_origin_locked  = false;
 static volatile uint32_t s_origin_last_ms = 0;
 
-static uint8_t s_channel = 1;   // for display / heartbeat
+static uint8_t s_channel = ESPNOW_CHANNEL;   // for display / heartbeat (NVS load in setup overrides)
 
 // ---- stats -----------------------------------------------------------------
 static volatile uint32_t s_relayed    = 0;    // packets successfully re-broadcast
@@ -289,7 +289,7 @@ void repeaterSetup() {
     {
         Preferences p;
         p.begin("espnow", true);
-        s_channel = p.getUChar("channel", 1);
+        s_channel = p.getUChar("channel", ESPNOW_CHANNEL);   // default = config.h (matches TX + RX)
         if (p.getBytesLength("relay_src") == 6) {
             uint8_t m[6];
             p.getBytes("relay_src", m, 6);
