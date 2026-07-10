@@ -256,12 +256,23 @@ static void xiaoUiLoop(uint32_t now) {
         }
         return;
     }
-    static uint32_t s_hb_at = 0, s_hb_relayed = 0;
+    // Liveness = the CHANNEL shown as N quick blinks per train (ch1=1, ch6=2,
+    // ch11=3) at a FIXED train interval, regardless of relay activity (clearer
+    // than the old interval-coded single flash — user 2026-07-10).
+    static uint32_t s_hb_at   = 0;
+    static uint8_t  s_hb_left = 0;   // on-pulses remaining in the current train
     if ((int32_t)(now - s_hb_at) >= 0) {
-        bool relaying = (s_relayed != s_hb_relayed);
-        s_hb_relayed = s_relayed;
-        if (!s_led_on) { xiaoLedSet(true);  s_hb_at = now + 40; }
-        else           { xiaoLedSet(false); s_hb_at = now + (relaying ? 460 : 1960); }
+        uint8_t blinks = (s_channel == 1) ? 1 : (s_channel == 6) ? 2 : 3;
+        if (s_hb_left == 0 && !s_led_on) {              // start a new train
+            s_hb_left = blinks;
+            xiaoLedSet(true);  s_hb_at = now + 60;
+        } else if (s_led_on) {                          // end of an on-pulse
+            xiaoLedSet(false);
+            s_hb_left--;
+            s_hb_at = now + (s_hb_left > 0 ? 180 : 1600);  // short gap in-train / long gap between trains
+        } else {                                        // next blink within the train
+            xiaoLedSet(true);  s_hb_at = now + 60;
+        }
     }
 }
 #endif // BOARD_XIAO_C6
