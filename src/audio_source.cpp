@@ -186,9 +186,11 @@ static uint8_t s_lr_preset = LR_PRESET_DEFAULT;   // NVS tx/lr_preset
 // Operator-set runtime overrides broadcast to every receiver. Set via serial
 // (loopTask); the beacon is sent from audioSourceLoop (also loopTask), burst ×3
 // on change then resent every 5 s so late-booting receivers catch up.
-static uint8_t s_fleet_val[5] = {0, 0, 0, 0, 0};                 // index = param_id (1-4)
-static bool    s_fleet_set[5] = {false, false, false, false, false};
+static uint8_t s_fleet_val[6] = {0, 0, 0, 0, 0, 0};             // index = param_id (1-5)
+static bool    s_fleet_set[6] = {false, false, false, false, false, false};
 static bool    s_fleet_dirty  = false;
+// Receiver volume-max (§3.5 param 5) — the 6 UI levels shown on the RX VOL screen.
+static const uint8_t VOLMAX_PCTS[6] = {10, 20, 40, 60, 80, 100};
 
 // In-flight depth (send-queue buffer). With 6 Mbps a depth of ~3 already
 // sustains the 1000 pkt/s stream, but a few % still drop on jitter. For
@@ -1009,7 +1011,7 @@ void audioSourceSetup() {
 // HOME shows the current mode + channel + live stats and two buttons. Tapping a
 // button drills into a full-screen selector; tapping the header returns. Mode /
 // channel changes reboot into the new setting (see audioSourceSetMode).
-enum { UI_HOME = 0, UI_FAMILY = 1, UI_MODE = 2, UI_CH = 3 };
+enum { UI_HOME = 0, UI_FAMILY = 1, UI_MODE = 2, UI_CH = 3, UI_VOLMAX = 4 };
 static uint8_t s_ui      = UI_HOME;
 static bool    s_uiDirty = true;              // force a full repaint on screen change
 static const uint16_t UI_SEL_BG = 0x0208;     // dark-cyan fill behind a selected item
@@ -1143,8 +1145,10 @@ static void uiRepaint() {
         d.setTextDatum(textdatum_t::top_left);
         d.drawString("pkt/s", 48, 210);
         d.drawString("drop", 122, 210);
-        uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
-        uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
+        // 3 drill-in buttons: MODE / CH / RX VOL (receiver volume-max, §3.5 p5).
+        uiBtn(6,   148, 100, 48, "MODE >",   TFT_DARKCYAN, TFT_CYAN, false);
+        uiBtn(110, 148,  60, 48, "CH >",     TFT_DARKCYAN, TFT_CYAN, false);
+        uiBtn(174, 148, 140, 48, "RX VOL >", TFT_DARKCYAN, TFT_CYAN, false);
     } else if (s_ui == UI_FAMILY) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
@@ -1211,7 +1215,7 @@ static void uiRepaint() {
             d.drawString(desc, x + 10, y + 38);
         }
         d.setTextDatum(textdatum_t::top_left);
-    } else {  // UI_CH
+    } else if (s_ui == UI_CH) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT CHANNEL", 6, 6);
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -1223,6 +1227,28 @@ static void uiRepaint() {
         }
         d.setTextSize(1); d.setTextColor(TFT_YELLOW, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("applies on select (reboot)", 8, 172);
+    } else {  // UI_VOLMAX — receiver volume ceiling (§3.5 param 5), fleet-wide
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< RX VOL MAX", 6, 6);
+        d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.drawString("all receivers: lower % = finer resolution", 8, 30);
+        // Highlight the current fleet value; before any selection show 100%
+        // (the receivers' default when nothing is broadcast).
+        uint8_t cur = s_fleet_set[5] ? s_fleet_val[5] : 100;
+        for (int i = 0; i < 6; i++) {
+            int col = i & 1, row = i >> 1;
+            int x = UI_MODE_X0 + col * UI_MODE_COLP;
+            int y = UI_MODE_Y0 + row * UI_MODE_ROWP;
+            bool sel = (VOLMAX_PCTS[i] == cur);
+            char lbl[8]; snprintf(lbl, sizeof(lbl), "%u%%", VOLMAX_PCTS[i]);
+            uint16_t bg = sel ? UI_SEL_BG : TFT_BLACK;
+            if (sel) d.fillRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, UI_SEL_BG);
+            d.drawRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, sel ? TFT_CYAN : TFT_DARKGREY);
+            d.setTextDatum(textdatum_t::middle_center);
+            d.setTextSize(3); d.setTextColor(sel ? TFT_WHITE : TFT_LIGHTGREY, bg);
+            d.drawString(lbl, x + UI_MODE_COLW / 2, y + UI_MODE_CELLH / 2);
+        }
+        d.setTextDatum(textdatum_t::top_left);
     }
     s_uiDirty = false;
 }
@@ -1260,9 +1286,12 @@ static void uiUpdateHome() {
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
     if (s_ui == UI_HOME) {
-        // RANGE is now chosen via MODE > SELECT TYPE > LONG RANGE (the HOME badge
-        // is display-only), so HOME only has the MODE / CHANNEL buttons.
-        if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
+        // HOME drill-in buttons: MODE (x<108) / CH (<172) / RX VOL (else).
+        // RANGE is chosen via MODE > SELECT TYPE > LONG RANGE (badge display-only).
+        if (y >= 148 && y <= 196) {
+            s_ui = (x < 108) ? UI_FAMILY : (x < 172) ? UI_CH : UI_VOLMAX;
+            s_uiDirty = true;
+        }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
         if (y >= 54 && y <= 204) {                                  // three family cells
@@ -1288,7 +1317,7 @@ static void uiTouch(int x, int y) {
             const FamilyDef& fam = FAMILY[s_uiFamily];
             if (i >= 0 && i < fam.count) audioSourceSetMode(fam.modes[i]);  // saves NVS + reboots
         }
-    } else {  // UI_CH
+    } else if (s_ui == UI_CH) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
         if (y >= 90 && y <= 152) {
             const uint8_t chs[3] = {1, 6, 11};
@@ -1298,6 +1327,20 @@ static void uiTouch(int x, int y) {
                 Serial.printf("[AUDIO-SRC] channel -> %u, rebooting\n", chs[i]);
                 delay(150); ESP.restart();
             }
+        }
+    } else {  // UI_VOLMAX — tap a % tile → 0xAC param 5 to the whole fleet
+        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back
+        if (x < UI_MODE_X0) return;
+        int col = (x - UI_MODE_X0) / UI_MODE_COLP;
+        int row = (y - UI_MODE_Y0) / UI_MODE_ROWP;
+        if (col < 0 || col > 1 || row < 0) return;
+        int cx = x - (UI_MODE_X0 + col * UI_MODE_COLP);
+        int cy = y - (UI_MODE_Y0 + row * UI_MODE_ROWP);
+        if (cx >= UI_MODE_COLW || cy < 0 || cy >= UI_MODE_CELLH) return;
+        int i = row * 2 + col;
+        if (i >= 0 && i < 6) {
+            audioSourceSetFleetParam(5, VOLMAX_PCTS[i]);   // 0xAC burst ×3 + 5 s resend
+            s_ui = UI_HOME; s_uiDirty = true;               // runtime beacon — no reboot
         }
     }
 }
@@ -1323,14 +1366,15 @@ static void fleetTick() {
     s_fleet_dirty = false;
     s_last = now;
     for (int r = 0; r < (burst ? 3 : 1); r++)
-        for (uint8_t pid = 1; pid <= 4; pid++)
+        for (uint8_t pid = 1; pid <= 5; pid++)
             if (s_fleet_set[pid]) sendFleetBeacon(pid, s_fleet_val[pid]);
 }
 
 // Public (serial set_fleet_param): 1=buffer_ms 2=selection 3=lock_timeout(×10ms)
-// 4=resync_gap. Stores the value + triggers a ×3 burst; then resent every 5 s.
+// 4=resync_gap 5=volume_max(%). Stores the value + triggers a ×3 burst; then
+// resent every 5 s.
 void audioSourceSetFleetParam(int param, int value) {
-    if (param < 1 || param > 4 || value < 0 || value > 255) return;
+    if (param < 1 || param > 5 || value < 0 || value > 255) return;
     s_fleet_val[param] = (uint8_t)value;
     s_fleet_set[param] = true;
     s_fleet_dirty      = true;

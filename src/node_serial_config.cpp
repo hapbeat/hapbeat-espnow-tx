@@ -247,7 +247,8 @@ static void handleLine(const char* line) {
         audioSourceSetLrBitrate(br);
         return;
     }
-    // set_fleet_param {"param":1-4,"value":0-255} → broadcast a 0xAC beacon.
+    // set_fleet_param {"param":1-5,"value":0-255} → broadcast a 0xAC beacon
+    // (5 = receiver volume_max %, §3.5).
     // 1=buffer_ms 2=selection 3=lock_timeout(×10ms) 4=resync_gap (§3.5).
     if (strcmp(cmd, "set_fleet_param") == 0) {
         int param = doc["param"] | 0;
