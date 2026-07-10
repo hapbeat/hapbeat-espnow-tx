@@ -45,6 +45,11 @@ VARIANTS = {
         "label": "M5Stack Basic (リピータ)",
         "description": "音声ソース機からの ESP-NOW ストリームを中継して受信機のカバレッジを拡張する。",
     },
+    "xiao_c6_repeater": {
+        "role": "transmitter", "transport": "espnow_stream", "board": "xiao_c6",
+        "label": "XIAO ESP32-C6 (リピータ)",
+        "description": "音声ソース機からの ESP-NOW ストリームを中継して受信機のカバレッジを拡張する小型リピータ（外部アンテナ・ヘッドレス）。",
+    },
 }
 
 

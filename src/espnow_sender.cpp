@@ -3,19 +3,31 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_idf_version.h>   // ESP_IDF_VERSION / ESP_IDF_VERSION_VAL (rate-config gate)
 #include <Preferences.h>
 #include <cstring>
 
 EspNowSender* EspNowSender::instance_ = nullptr;
 
-// File-local callback with the correct esp_now_send_status_t signature.
-// Delegates to the public handleSendResult method via the singleton pointer.
+// File-local ESP-NOW send callback. arduino-esp32 3.x (IDF5) changed the
+// signature to esp_now_send_info_t* (= wifi_tx_info_t; dest MAC in des_addr);
+// 2.x passed the bare MAC. Both delegate to handleSendResult.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+static void espnow_on_send(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
+    EspNowSender* inst = EspNowSender::getInstance();
+    if (inst) {
+        inst->handleSendResult(status == ESP_NOW_SEND_SUCCESS,
+                               tx_info ? tx_info->des_addr : nullptr);
+    }
+}
+#else
 static void espnow_on_send(const uint8_t* mac_addr, esp_now_send_status_t status) {
     EspNowSender* inst = EspNowSender::getInstance();
     if (inst) {
         inst->handleSendResult(status == ESP_NOW_SEND_SUCCESS, mac_addr);
     }
 }
+#endif
 
 EspNowSender::EspNowSender()
     : initialized_(false)
@@ -37,7 +49,11 @@ bool EspNowSender::init() {
     // (~1 ms airtime per small packet → caps small-packet throughput near
     // ~800-1000/s, which forced a deep in-flight queue and added latency).
     esp_wifi_set_ps(WIFI_PS_NONE);                 // no modem sleep (latency/jitter)
-    esp_wifi_set_max_tx_power(84);                  // 21 dBm
+#ifdef BOARD_XIAO_C6
+    esp_wifi_set_max_tx_power(80);                  // C6 max (~20 dBm)
+#else
+    esp_wifi_set_max_tx_power(84);                  // S3 / classic ESP32 (~21 dBm)
+#endif
     esp_wifi_set_protocol(WIFI_IF_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
@@ -46,7 +62,9 @@ bool EspNowSender::init() {
     // throughput ceiling well above the 1000 pkt/s the 16 kHz/16-frame stream
     // needs, so a shallow in-flight depth keeps latency low. 6 Mbps also has
     // ~+14 dB RX sensitivity vs 54 Mbps, so range stays good.
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);  // IDF4 (S3 / classic)
+#endif
 #endif
 
     // Set the WiFi channel. NVS wins over the compile-time default so the
@@ -86,10 +104,20 @@ bool EspNowSender::init() {
     }
 
 #if defined(AUDIO_SOURCE) || defined(REPEATER)
-    // Re-apply the ESP-NOW PHY rate AFTER esp_now_init() — applying it only
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    // IDF5 (XIAO C6): esp_wifi_config_espnow_rate is deprecated → per-peer rate,
+    // applied after esp_now_add_peer().
+    esp_now_rate_config_t rate_cfg = {};
+    rate_cfg.phymode = WIFI_PHY_MODE_11G;
+    rate_cfg.rate    = WIFI_PHY_RATE_6M;
+    esp_err_t rate_err = esp_now_set_peer_rate_config(BROADCAST_MAC, &rate_cfg);
+    log_i("ESP-NOW rate 6M (peer_rate_config) rc=%d", (int)rate_err);
+#else
+    // IDF4 (S3 / classic): re-apply AFTER esp_now_init() — applying it only
     // before init did not stick (throughput stayed at the 1 Mbps default).
     esp_err_t rate_err = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
     log_i("ESP-NOW rate 6M (post-init) rc=%d", (int)rate_err);
+#endif
 #endif
 
     initialized_ = true;
@@ -143,10 +171,12 @@ uint32_t EspNowSender::getTotalFailed() const {
 
 void EspNowSender::handleSendResult(bool success, const uint8_t* mac_addr) {
     last_result_ = success;
-    if (!success) {
+    if (!success && mac_addr) {
         log_w("ESP-NOW delivery failed to %02X:%02X:%02X:%02X:%02X:%02X",
               mac_addr[0], mac_addr[1], mac_addr[2],
               mac_addr[3], mac_addr[4], mac_addr[5]);
+    } else if (!success) {
+        log_w("ESP-NOW delivery failed");
     }
 }
 

@@ -56,7 +56,9 @@ static void macToStr(const uint8_t* mac, char* buf, size_t n) {
 // board string reported in get_info — must match gen_variant.py's VARIANTS
 // table (scripts/gen_variant.py) so Studio's firmware-library board check
 // and device-list board readout agree on the same identifiers.
-#ifdef BOARD_CORES3
+#if defined(BOARD_XIAO_C6)
+static const char* BOARD_ID = "xiao_c6";
+#elif defined(BOARD_CORES3)
 static const char* BOARD_ID = "m5stack_cores3";
 #else
 static const char* BOARD_ID = "m5stack_basic";

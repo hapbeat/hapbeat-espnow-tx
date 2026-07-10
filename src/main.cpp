@@ -1,17 +1,21 @@
 #include <Arduino.h>
-#ifdef BOARD_CORES3
-#include <M5Unified.h>   // CoreS3: M5Unified (classic M5Stack lib is unsupported)
-#else
-#include <M5Stack.h>
+#ifndef BOARD_XIAO_C6
+  #ifdef BOARD_CORES3
+  #include <M5Unified.h>   // CoreS3: M5Unified (classic M5Stack lib is unsupported)
+  #else
+  #include <M5Stack.h>
+  #endif
 #endif
 #include "config.h"
 #include "types.h"
-#include "serial_handler.h"
 #include "espnow_sender.h"
+#include "node_serial_config.h"
+#include "display.h"                // XIAO C6: headless no-op stubs (display_stub.cpp)
+#if !defined(AUDIO_SOURCE) && !defined(REPEATER)
+#include "serial_handler.h"         // Bridge relay path only
 #include "command_dispatcher.h"
 #include "time_sync.h"
-#include "display.h"
-#include "node_serial_config.h"
+#endif
 #ifdef AUDIO_SOURCE
 #include "audio_source.h"
 #endif
@@ -37,19 +41,21 @@ static constexpr uint32_t SERIAL_CONNECT_TIMEOUT_MS = 5000;
 #endif
 
 void setup() {
+#ifndef BOARD_XIAO_C6
     // Initialize the M5 board.
-#ifdef BOARD_CORES3
+  #ifdef BOARD_CORES3
     // CoreS3: M5Unified auto-detects the board and brings up the AXP2101 PMIC
     // (which powers the M-Bus / Module Audio), the display, and internal I2C.
     auto m5cfg = M5.config();
     m5cfg.serial_baudrate = SERIAL_BAUD;
     M5.begin(m5cfg);
-#else
+  #else
     // Classic Core/Basic (M5Stack library).
     M5.begin(true, false, true, false);  // LCD=true, SD=false, Serial=true, I2C=false
-#endif
+  #endif
+#endif  // BOARD_XIAO_C6 (headless — no M5 board init)
 
-    displayInit();
+    displayInit();               // no-op on XIAO (headless stub)
     displayBootStatus("Serial init...");
 
 #ifdef AUDIO_SOURCE

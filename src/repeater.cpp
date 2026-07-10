@@ -101,7 +101,7 @@ static void onReceiveCbBody(const uint8_t* src, const uint8_t* data, int len) {
     // changed; seq/body/piggyback are verbatim (receiver piggyback matches
     // prev_seq by absolute value, so seq MUST NOT be rewritten).
     uint32_t head = s_slot_head;
-    if ((head - s_slot_tail) >= (uint32_t)SLOT_COUNT) { s_slot_drops++; return; }
+    if ((head - s_slot_tail) >= (uint32_t)SLOT_COUNT) { s_slot_drops = s_slot_drops + 1; return; }
     RelaySlot& sl = s_slots[head % SLOT_COUNT];
     memcpy(sl.buf, data, (size_t)len);
     sl.buf[1] |= 0x80;
@@ -121,6 +121,76 @@ static void onReceiveCb(const uint8_t* src, const uint8_t* data, int len) {
     onReceiveCbBody(src, data, len);
 }
 #endif
+
+// ---- XIAO ESP32-C6 headless UI: external antenna + BOOT button + user LED ----
+// GPIO per the Seeed XIAO ESP32-C6 wiki (verified 2026-07-09):
+//   WIFI_ENABLE (GPIO3)      = RF switch enable — LOW activates the switch
+//   WIFI_ANT_CONFIG (GPIO14) = antenna select  — HIGH = external u.FL, LOW = ceramic
+//   BOOT button = GPIO9 (active-LOW), User LED = LED_BUILTIN (GPIO15)
+// WIFI_ENABLE / WIFI_ANT_CONFIG / LED_BUILTIN are the core's pins_arduino.h macros.
+#ifdef BOARD_XIAO_C6
+static const int     XIAO_BOOT_PIN = 9;      // BOOT button (Seeed wiki), active-LOW
+// User LED polarity is undocumented; assumed active-LOW (XIAO convention /
+// ESPHome inverted:true). Cosmetic — a wrong guess only inverts the blink.
+static const uint8_t XIAO_LED_ON  = LOW;
+static const uint8_t XIAO_LED_OFF = HIGH;
+
+static bool     s_led_on        = false;
+static uint8_t  s_blink_pending = 0;         // queued channel-feedback blinks (1/2/3)
+static uint32_t s_blink_at      = 0;
+
+static inline void xiaoLedSet(bool on) {
+    s_led_on = on;
+    digitalWrite(LED_BUILTIN, on ? XIAO_LED_ON : XIAO_LED_OFF);
+}
+
+static void xiaoUiSetup() {
+    // Select the external u.FL antenna (better range for a coverage repeater).
+    pinMode(WIFI_ENABLE, OUTPUT);      digitalWrite(WIFI_ENABLE, LOW);       // enable RF switch
+    pinMode(WIFI_ANT_CONFIG, OUTPUT);  digitalWrite(WIFI_ANT_CONFIG, HIGH);  // external antenna
+    pinMode(XIAO_BOOT_PIN, INPUT_PULLUP);
+    pinMode(LED_BUILTIN, OUTPUT);      xiaoLedSet(false);
+    Serial.println("[REPEATER] XIAO C6: external antenna, BOOT=ch-cycle");
+}
+
+static void xiaoUiLoop(uint32_t now) {
+    // BOOT short-press cycles the ESP-NOW channel 1 -> 6 -> 11 (persisted + live).
+    static bool     prev_down = false;
+    static uint32_t press_at  = 0;
+    bool down = (digitalRead(XIAO_BOOT_PIN) == LOW);
+    if (down && !prev_down) press_at = now;                     // press edge
+    if (!down && prev_down) {                                   // release edge
+        uint32_t held = now - press_at;
+        if (held >= 30 && held < 1500) {                        // short press (30 ms debounce)
+            uint8_t next = (s_channel == 1) ? 6 : (s_channel == 6) ? 11 : 1;
+            s_channel = next;
+            Preferences p; p.begin("espnow", false); p.putUChar("channel", next); p.end();
+            esp_wifi_set_channel(next, WIFI_SECOND_CHAN_NONE);  // live apply
+            s_blink_pending = (next == 1) ? 1 : (next == 6) ? 2 : 3;
+            s_blink_at = now;
+            Serial.printf("[REPEATER] channel -> %u\n", next);
+        }
+    }
+    prev_down = down;
+
+    // LED: channel-feedback blink train takes priority; else a liveness heartbeat
+    // (brief flash ~every 2 s, faster while actively relaying).
+    if (s_blink_pending > 0) {
+        if ((int32_t)(now - s_blink_at) >= 0) {
+            if (!s_led_on) { xiaoLedSet(true);  s_blink_at = now + 150; }
+            else           { xiaoLedSet(false); s_blink_at = now + 150; s_blink_pending--; }
+        }
+        return;
+    }
+    static uint32_t s_hb_at = 0, s_hb_relayed = 0;
+    if ((int32_t)(now - s_hb_at) >= 0) {
+        bool relaying = (s_relayed != s_hb_relayed);
+        s_hb_relayed = s_relayed;
+        if (!s_led_on) { xiaoLedSet(true);  s_hb_at = now + 40; }
+        else           { xiaoLedSet(false); s_hb_at = now + (relaying ? 460 : 1960); }
+    }
+}
+#endif // BOARD_XIAO_C6
 
 // ---------------------------------------------------------------------------
 void repeaterSetup() {
@@ -150,6 +220,9 @@ void repeaterSetup() {
     } else {
         Serial.printf("[REPEATER] ch=%u mode=auto-follow\n", s_channel);
     }
+#ifdef BOARD_XIAO_C6
+    xiaoUiSetup();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +230,7 @@ void repeaterLoop() {
     // Drain the SPSC ring (consumer).
     while (s_slot_tail != s_slot_head) {
         RelaySlot& sl = s_slots[s_slot_tail % SLOT_COUNT];
-        if (esp_now_send(BROADCAST_MAC, sl.buf, (size_t)sl.len) == ESP_OK) s_relayed++;
+        if (esp_now_send(BROADCAST_MAC, sl.buf, (size_t)sl.len) == ESP_OK) s_relayed = s_relayed + 1;
         s_slot_tail = s_slot_tail + 1;   // release slot
     }
 
@@ -196,6 +269,10 @@ void repeaterLoop() {
         displayUpdateRepeaterStats(s_channel, mac_str,
                                    (uint32_t)s_relayed, (uint32_t)s_slot_drops);
     }
+#endif
+
+#ifdef BOARD_XIAO_C6
+    xiaoUiLoop(now);
 #endif
 }
 

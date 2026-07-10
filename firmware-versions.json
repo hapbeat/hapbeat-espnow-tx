@@ -5,6 +5,7 @@
     "esp32": "0.1.0",
     "m5stack_audio_tx": "0.1.0",
     "m5stack_cores3_audio_tx": "0.1.0",
-    "m5stack_repeater": "0.1.0"
+    "m5stack_repeater": "0.1.0",
+    "xiao_c6_repeater": "0.1.0"
   }
 }
