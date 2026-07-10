@@ -189,8 +189,86 @@ static uint8_t s_lr_preset = LR_PRESET_DEFAULT;   // NVS tx/lr_preset
 static uint8_t s_fleet_val[6] = {0, 0, 0, 0, 0, 0};             // index = param_id (1-5)
 static bool    s_fleet_set[6] = {false, false, false, false, false, false};
 static bool    s_fleet_dirty  = false;
+// Per-param epoch (P1.1, §3.5 epoch sync). Bumped on every LOCAL change (operator
+// touch/serial) so peer transmitters can tell a newer local value from a stale
+// echo. Persisted to NVS alongside the value+set-mask (P1.4) so a reboot resumes
+// broadcasting the same value at the same epoch — a peer's beacon that only saw
+// the pre-reboot epoch must not look "newer" and wrongly overwrite us back.
+static uint8_t s_fleet_epoch[6] = {0, 0, 0, 0, 0, 0};
+// This transmitter's own MAC (populated in audioSourceSetup via WiFi.macAddress).
+// Used only for the same-epoch/different-value tie-break in audioOnRecvCb (P1.2).
+static uint8_t s_self_mac[6] = {0, 0, 0, 0, 0, 0};
 // Receiver volume-max (§3.5 param 5) — the 6 UI levels shown on the RX VOL screen.
 static const uint8_t VOLMAX_PCTS[6] = {10, 20, 40, 60, 80, 100};
+
+// Persist one fleet param's value + epoch to NVS ("tx" namespace, keys "fpN"/
+// "feN") and mark it set in the "fp_set" bitmask (bit (param-1)) — restored at
+// boot in audioSourceSetup so a reboot doesn't blank the broadcast (P1.1/P1.4).
+// CALLER MUST be the loop task (fleetTick / audioSourceSetFleetParam), never the
+// ESP-NOW recv callback — see s_fleet_persist_pending below.
+static void persistFleetParam(uint8_t param) {
+    char kv[8], ke[8];
+    snprintf(kv, sizeof(kv), "fp%u", param);
+    snprintf(ke, sizeof(ke), "fe%u", param);
+    Preferences p; p.begin("tx", false);
+    p.putUChar(kv, s_fleet_val[param]);
+    p.putUChar(ke, s_fleet_epoch[param]);
+    p.putUChar("fp_set", (uint8_t)(p.getUChar("fp_set", 0) | (1 << (param - 1))));
+    p.end();
+}
+
+// Params adopted from a peer TX (audioOnRecvCb) whose NVS write + log line are
+// still pending. Bit (param-1). audioOnRecvCb runs on the WiFi task and MUST
+// NOT call Preferences/Serial there — both can block long enough to stall
+// ESP-NOW RX (the same reasoning volumeServiceTick documents on the receiver
+// side, and the reason repeater.cpp's recv callback only touches a lock-free
+// ring buffer). fleetTick (loop task) drains this and does the actual I/O
+// (self-review F2 fix).
+static volatile uint8_t s_fleet_persist_pending = 0;
+
+// TX-TX fleet-param sync (P1.2, §3.5 epoch sync). Runs in the ESP-NOW recv
+// callback (WiFi task) — mirrors repeater.cpp's onReceiveCb pattern, but this
+// build (AUDIO_SOURCE) previously registered no recv cb at all. Only 0xAC with
+// an epoch byte [4] is actionable: two active transmitters broadcasting
+// DIFFERENT fleet values (e.g. volume_max) make receivers' values step on every
+// source handoff (ops runbook pre-deploy check #1) — this converges every
+// transmitter on the same value+epoch within one beacon round-trip (≤5s, faster
+// with the ×3 burst).
+//   - RELAYED (bit7 set) is skipped: sync is origin-to-origin only, so a
+//     repeater's delayed copy of our own beacon can't be mistaken for a peer
+//     and cause oscillation (P1.3).
+//   - No epoch (len<5, legacy/no-op sender) is skipped: nothing to compare.
+//   - Newer epoch (wrap-safe int8 delta) → adopt.
+//   - Same epoch, different value (only possible if two TXs changed the same
+//     param independently at the same local epoch) → the numerically LARGER
+//     source MAC wins (deterministic on both sides: the loser's next receive of
+//     its own now-stale broadcast compares equal MAC-loss the other way and
+//     adopts) (P1.2 tie-break).
+//   - Same epoch, same value → already in sync, no-op (prevents a resend loop).
+static void audioOnRecvCb(const uint8_t* mac, const uint8_t* data, int len) {
+    if (len < 5 || data[0] != 0xAC) return;      // need the epoch byte to compare
+    if (data[1] & 0x80) return;                  // RELAYED → not origin-to-origin
+    uint8_t param = data[2];
+    if (param < 1 || param > 5) return;
+    uint8_t value = data[3];
+    uint8_t epoch = data[4];
+    if (s_fleet_set[param]) {
+        int8_t delta = (int8_t)(epoch - s_fleet_epoch[param]);
+        if (delta < 0) return;                                  // remote is stale
+        if (delta == 0) {
+            if (value == s_fleet_val[param]) return;              // already in sync
+            if (memcmp(mac, s_self_mac, 6) <= 0) return;           // tie-break: bigger MAC wins
+        }
+    }
+    s_fleet_val[param]   = value;
+    s_fleet_epoch[param] = epoch;
+    s_fleet_set[param]   = true;
+    s_fleet_dirty        = true;      // adopted value gets its own ×3 burst promptly
+    // NVS write + log line deferred to fleetTick (loop task) — see
+    // s_fleet_persist_pending's docstring (self-review F2 fix). Setting one bit
+    // in a volatile uint8 is the only work this callback does beyond RAM state.
+    s_fleet_persist_pending |= (uint8_t)(1 << (param - 1));
+}
 
 // In-flight depth (send-queue buffer). With 6 Mbps a depth of ~3 already
 // sustains the 1000 pkt/s stream, but a few % still drop on jitter. For
@@ -890,8 +968,24 @@ void audioSourceSetup() {
         s_range_long  = p.getBool("range_long", false);
         s_lr_preset   = p.getUChar("lr_preset", LR_PRESET_DEFAULT);
         if (s_lr_preset >= LR_PRESET_COUNT) s_lr_preset = LR_PRESET_DEFAULT;
+        // Restore fleet-tune params (P1.4): a reboot must resume broadcasting the
+        // same value at the same epoch, or a peer TX that only saw the pre-reboot
+        // epoch would see us as "still at the old value" and could win a stale
+        // tie-break against a legitimate newer local change made just before boot.
+        uint8_t fp_set = p.getUChar("fp_set", 0);
+        for (uint8_t pid = 1; pid <= 5; pid++) {
+            if (!(fp_set & (1 << (pid - 1)))) continue;
+            char kv[8], ke[8];
+            snprintf(kv, sizeof(kv), "fp%u", pid);
+            snprintf(ke, sizeof(ke), "fe%u", pid);
+            s_fleet_val[pid]   = p.getUChar(kv, 0);
+            s_fleet_epoch[pid] = p.getUChar(ke, 0);
+            s_fleet_set[pid]   = true;
+            s_fleet_dirty      = true;   // resume the ×3 burst + 5s resend on boot
+        }
         p.end();
     }
+    WiFi.macAddress(s_self_mac);   // for the TX-TX sync tie-break (P1.2)
 #ifdef BOARD_CORES3
     // RANGE=LONG pins the LR profile (id3 Opus wire; CoreS3-only). Force the mode
     // here so the persisted audio mode is ignored while LONG (restored on NORMAL).
@@ -904,6 +998,11 @@ void audioSourceSetup() {
     // (6 Mbps, PS off) + esp_now_init. Replace its send callback with ours so
     // we can track in-flight depth.
     esp_now_register_send_cb(audioOnSendCb);
+    // TX-TX fleet-param sync (P1.2): previously AUDIO_SOURCE registered no recv
+    // cb at all (a sender never needed to receive). audioOnRecvCb only acts on
+    // 0xAC fleet-tune beacons from a PEER transmitter (own broadcasts are not
+    // looped back to the sender by ESP-NOW).
+    esp_now_register_recv_cb(audioOnRecvCb);
 
 #ifdef BOARD_CORES3
     if (s_range_long) {
@@ -1353,8 +1452,10 @@ static void uiTouch(int x, int y) {
 // ---- Fleet-tune (0xAC beacon, §3.5) — send side ---------------------------
 // Broadcast one 0xAC beacon. Mirrors the audio path's s_inflight accounting so
 // the shared send-callback (audioOnSendCb) stays balanced.
-static void sendFleetBeacon(uint8_t param, uint8_t value) {
-    uint8_t pkt[4] = { 0xAC, 0x01, param, value };   // [1] = version 1, RELAYED=0
+static void sendFleetBeacon(uint8_t param, uint8_t value, uint8_t epoch) {
+    // [4] = epoch (P1.1, §3.5 epoch sync) — lets a receiving TX/receiver tell a
+    // newer value from a stale duplicate. 5 B total (was 4 B pre-epoch).
+    uint8_t pkt[5] = { 0xAC, 0x01, param, value, epoch };   // [1] = version 1, RELAYED=0
     s_inflight++;
     if (esp_now_send(BROADCAST_MAC, pkt, sizeof(pkt)) != ESP_OK) s_inflight--;
 }
@@ -1362,6 +1463,21 @@ static void sendFleetBeacon(uint8_t param, uint8_t value) {
 // Resend the set fleet params: burst ×3 on a change, then a single refresh every
 // 5 s (late-booting receivers catch up). Called from audioSourceLoop (loopTask).
 static void fleetTick() {
+    // Drain params adopted from a peer TX (audioOnRecvCb, WiFi task) — the NVS
+    // write + log line are deferred here (loop task) so the recv callback stays
+    // free of blocking I/O (self-review F2 fix). `&= ~pending` (not `= 0`) so a
+    // bit the callback sets DURING this drain survives to the next tick instead
+    // of being silently cleared.
+    uint8_t pending = s_fleet_persist_pending;
+    if (pending) {
+        s_fleet_persist_pending &= (uint8_t)~pending;
+        for (uint8_t pid = 1; pid <= 5; pid++) {
+            if (!(pending & (1 << (pid - 1)))) continue;
+            persistFleetParam(pid);
+            Serial.printf("[AUDIO-SRC] fleet param %u adopted from peer TX (val=%u epoch=%u)\n",
+                          pid, s_fleet_val[pid], s_fleet_epoch[pid]);
+        }
+    }
     static uint32_t s_last = 0;
     uint32_t now = millis();
     bool burst = s_fleet_dirty;
@@ -1370,18 +1486,24 @@ static void fleetTick() {
     s_last = now;
     for (int r = 0; r < (burst ? 3 : 1); r++)
         for (uint8_t pid = 1; pid <= 5; pid++)
-            if (s_fleet_set[pid]) sendFleetBeacon(pid, s_fleet_val[pid]);
+            if (s_fleet_set[pid]) sendFleetBeacon(pid, s_fleet_val[pid], s_fleet_epoch[pid]);
 }
 
-// Public (serial set_fleet_param): 1=buffer_ms 2=selection 3=lock_timeout(×10ms)
-// 4=resync_gap 5=volume_max(%). Stores the value + triggers a ×3 burst; then
-// resent every 5 s.
+// Public (serial set_fleet_param / RX VOL touch): 1=buffer_ms 2=selection
+// 3=lock_timeout(×10ms) 4=resync_gap 5=volume_max(%). Stores the value, bumps
+// this param's LOCAL epoch (P1.1 — every operator-initiated change is a new
+// epoch, whether or not the value differs from what's already broadcasting, so
+// a peer TX always converges to the freshest operator intent), persists both
+// (P1.4 — reboot-safe), and triggers a ×3 burst; then resent every 5 s.
 void audioSourceSetFleetParam(int param, int value) {
     if (param < 1 || param > 5 || value < 0 || value > 255) return;
-    s_fleet_val[param] = (uint8_t)value;
-    s_fleet_set[param] = true;
-    s_fleet_dirty      = true;
-    Serial.printf("[AUDIO-SRC] fleet param %d = %d (burst + 5s resend)\n", param, value);
+    s_fleet_val[param]   = (uint8_t)value;
+    s_fleet_epoch[param] = (uint8_t)(s_fleet_epoch[param] + 1);   // wraps by design (wrap-safe compare)
+    s_fleet_set[param]   = true;
+    s_fleet_dirty        = true;
+    persistFleetParam(param);
+    Serial.printf("[AUDIO-SRC] fleet param %d = %d (epoch %u, burst + 5s resend)\n",
+                  param, value, s_fleet_epoch[param]);
 }
 
 // Public (serial set_range_mode): persist RANGE (keeps the current LR preset) +

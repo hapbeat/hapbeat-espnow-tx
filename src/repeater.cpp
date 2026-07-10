@@ -93,11 +93,17 @@ static void macToStr(const uint8_t* mac, char* buf, size_t bufsz) {
 // ---- relay logic (called from the WiFi task — do NOT esp_now_send here) -----
 // `src` is the 6-byte sender MAC (both callback signatures resolve to this).
 static void onReceiveCbBody(const uint8_t* src, const uint8_t* data, int len) {
-    // Relay the audio stream (0xAA, >=5 B) AND the fleet-tune beacon (0xAC, 4 B).
-    // Both carry the RELAYED flag in byte[1] bit7 (DEC-043 §3.5 / §7.2), so the
-    // set-bit7 + no-relay-relayed 1-hop logic below is identical for either.
+    // Relay the audio stream (0xAA, >=5 B) AND the fleet-tune beacon (0xAC,
+    // 4-8 B — 4 B legacy / 5 B with the epoch byte at [4], §3.5 fleettune-epoch
+    // P0.2/P1.1; symmetric with espnow_receiver.cpp's dispatch range so the
+    // relay path doesn't silently drop the epoch-carrying beacon self-review
+    // caught: sendFleetBeacon is now always 5 B, so a hard len==4 here would
+    // make every fleet-tune param (not just epoch sync) stop reaching any
+    // repeater-only receiver). Both carry the RELAYED flag in byte[1] bit7
+    // (DEC-043 §3.5 / §7.2), so the set-bit7 + no-relay-relayed 1-hop logic
+    // below is identical for either.
     bool is_stream = (len >= 5 && len <= 250 && data[0] == STREAM_TYPE);
-    bool is_fleet  = (len == 4 && data[0] == FLEET_TYPE);
+    bool is_fleet  = (len >= 4 && len <= 8 && data[0] == FLEET_TYPE);
     if (!is_stream && !is_fleet) return;
     if (data[1] & 0x80) return;                    // RELAYED already set → never relay (1-hop cap)
 
