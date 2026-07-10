@@ -135,6 +135,11 @@ static void handleLine(const char* line) {
         p.begin("tx", true);
         r["input_level"] = p.getInt("input_level", 50);
         p.end();
+#ifdef AUDIO_SOURCE
+        // LONGRANGE state (DEC-043 P5). Only the live audio source carries it.
+        r["range"]      = audioSourceGetRange() ? "long" : "normal";
+        r["lr_bitrate"] = audioSourceGetLrBitrate();
+#endif
 
         sendResp(r);
         return;
@@ -204,6 +209,41 @@ static void handleLine(const char* line) {
         sendResp(r);
         return;
     }
+
+#ifdef AUDIO_SOURCE
+    // ---- LONGRANGE + fleet-tune (DEC-043 P5) -------------------------------
+    // set_range_mode {"long":bool} → NVS tx/range_long + reboot (CoreS3 only).
+    if (strcmp(cmd, "set_range_mode") == 0) {
+        bool lng = doc["long"] | false;
+        r["status"] = "ok"; r["cmd"] = cmd; r["range"] = lng ? "long" : "normal";
+        sendResp(r);                       // reply BEFORE the reboot inside the setter
+        audioSourceSetRange(lng);
+        return;
+    }
+    // set_lr_bitrate {"bitrate":24000|32000|48000} → NVS + reboot (LR profile).
+    if (strcmp(cmd, "set_lr_bitrate") == 0) {
+        int br = doc["bitrate"] | 24000;
+        if (br != 24000 && br != 32000 && br != 48000) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "bitrate must be 24000/32000/48000";
+            sendResp(r); return;
+        }
+        r["status"] = "ok"; r["cmd"] = cmd; r["bitrate"] = br;
+        sendResp(r);
+        audioSourceSetLrBitrate(br);
+        return;
+    }
+    // set_fleet_param {"param":1-4,"value":0-255} → broadcast a 0xAC beacon.
+    // 1=buffer_ms 2=selection 3=lock_timeout(×10ms) 4=resync_gap (§3.5).
+    if (strcmp(cmd, "set_fleet_param") == 0) {
+        int param = doc["param"] | 0;
+        int value = doc["value"] | 0;
+        audioSourceSetFleetParam(param, value);
+        r["status"] = "ok"; r["cmd"] = cmd; r["param"] = param; r["value"] = value;
+        sendResp(r);
+        return;
+    }
+#endif
 
     // ---- set_relay_source --------------------------------------------------
     // Sets the source MAC to relay (for REPEATER builds; stored for all modes

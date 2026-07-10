@@ -24,4 +24,13 @@ void audioSourceApplyInputLevel(int level);
 void audioSourceSetMode(int mode);
 int  audioSourceGetMode();
 
+// LONGRANGE + fleet-tune (DEC-043 P5). set_range_mode / set_lr_bitrate persist +
+// reboot (range is CoreS3-only — the LR profile is Opus). set_fleet_param
+// broadcasts a 0xAC beacon (burst ×3 + 5 s resend). Getters feed get_info.
+void audioSourceSetRange(bool long_range);
+void audioSourceSetLrBitrate(int bitrate);
+void audioSourceSetFleetParam(int param, int value);
+bool audioSourceGetRange();
+int  audioSourceGetLrBitrate();
+
 #endif // AUDIO_SOURCE_H

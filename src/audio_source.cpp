@@ -159,6 +159,24 @@ static_assert(OPUS_MAX_SMP >= 160, "OPUS_MAX_SMP must hold the largest MODE_DEFS
 // Live-selectable current mode (NVS "tx"/"mode", default 0 = ADPCM known-good).
 static volatile uint8_t s_mode = MODE_ADPCM;
 
+// ---- LONGRANGE profile (DEC-043 P5 §7.3) ----------------------------------
+// RANGE=LONG (NVS tx/range_long) switches the radio to 802.11 LR / LORA_500K and
+// pins the stream to the "LR profile": mode_id 3 (SMOOTH wire = Opus 8k mono
+// 10 ms) at a low, field-adjustable bitrate (NVS tx/lr_bitrate — 24/32/48k) + pb1.
+// The wire stays id3, so receivers/repeaters need no change (Opus self-describing;
+// bitrate too). CoreS3-only (Opus). The sender UI labels it "LR", not "SMOOTH".
+static bool          s_range_long = false;
+static uint16_t      s_lr_bitrate = 24000;
+static const uint8_t LR_MODE      = MODE_Q;   // id 3 = SMOOTH wire host
+
+// ---- Fleet-tune (0xAC beacon, §3.5) ---------------------------------------
+// Operator-set runtime overrides broadcast to every receiver. Set via serial
+// (loopTask); the beacon is sent from audioSourceLoop (also loopTask), burst ×3
+// on change then resent every 5 s so late-booting receivers catch up.
+static uint8_t s_fleet_val[5] = {0, 0, 0, 0, 0};                 // index = param_id (1-4)
+static bool    s_fleet_set[5] = {false, false, false, false, false};
+static bool    s_fleet_dirty  = false;
+
 // In-flight depth (send-queue buffer). With 6 Mbps a depth of ~3 already
 // sustains the 1000 pkt/s stream, but a few % still drop on jitter. For
 // loss-isolation we run a deliberately deep buffer so sender drops -> ~0
@@ -543,7 +561,10 @@ static void opusEncoderConfig(uint8_t mode) {
                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
         opus_encoder_init(s_enc, rate, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
-        opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(MODE_DEFS[mode].bitrate));
+        // RANGE=LONG on the id3 host uses the field-adjustable LR bitrate (§7.3),
+        // not MODE_DEFS[3]'s 60k — a low bitrate is what makes LR 2-source-viable.
+        uint32_t br = (s_range_long && mode == LR_MODE) ? s_lr_bitrate : MODE_DEFS[mode].bitrate;
+        opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(br));
         opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(MODE_DEFS[mode].complexity));
         opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
     }
@@ -560,7 +581,8 @@ static void opusEncoderConfig(uint8_t mode) {
 // Body: [4]=opus_len(1) [5..]=frame ; then pb× [prev_seq(1)][len(1)][data].
 static void sendOpusPacket(const uint8_t* frame, int flen) {
     uint8_t mode = s_mode;
-    int depth = MODE_DEFS[mode].piggyback;
+    // RANGE=LONG drops piggyback to 1 (§7.3) to trim the LR airtime budget.
+    int depth = (s_range_long && mode == LR_MODE) ? 1 : MODE_DEFS[mode].piggyback;
     int pbn   = s_opHistN < depth ? s_opHistN : depth;
 
     if (s_inflight >= STREAM_MAX_INFLIGHT) {
@@ -848,13 +870,34 @@ void audioSourceSetup() {
         s_input_level = p.getInt("input_level", 50);
         s_mode        = p.getUChar("mode", MODE_ADPCM);
         if (s_mode >= MODE_COUNT) s_mode = MODE_ADPCM;
+        s_range_long  = p.getBool("range_long", false);
+        s_lr_bitrate  = p.getUShort("lr_bitrate", 24000);
         p.end();
     }
+#ifdef BOARD_CORES3
+    // RANGE=LONG pins the LR profile (id3 Opus wire; CoreS3-only). Force the mode
+    // here so the persisted audio mode is ignored while LONG (restored on NORMAL).
+    if (s_range_long) s_mode = LR_MODE;
+#else
+    s_range_long = false;   // classic sender has no Opus → no LR profile
+#endif
 
     // EspNowSender::init() (main.cpp) already did WiFi STA + radio tuning
     // (6 Mbps, PS off) + esp_now_init. Replace its send callback with ours so
     // we can track in-flight depth.
     esp_now_register_send_cb(audioOnSendCb);
+
+#ifdef BOARD_CORES3
+    if (s_range_long) {
+        // RANGE=LONG (§7.3): 802.11 LR / LORA_500K, overriding EspNowSender::init()'s
+        // bgn / 6M. The LR profile is Opus (id3) → CoreS3-only.
+        esp_wifi_set_protocol(WIFI_IF_STA,
+            WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+        esp_err_t re = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_500K);
+        Serial.printf("[AUDIO-SRC] RANGE=LONG: LR/LORA_500K rc=%d, profile id%u %u bps pb1\n",
+                      (int)re, LR_MODE, s_lr_bitrate);
+    }
+#endif
 
     adpcmStateInit(&s_sl);
     adpcmStateInit(&s_sr);
@@ -1185,8 +1228,73 @@ static void uiTouch(int x, int y) {
 #endif
 
 // ---------------------------------------------------------------------------
+// ---- Fleet-tune (0xAC beacon, §3.5) — send side ---------------------------
+// Broadcast one 0xAC beacon. Mirrors the audio path's s_inflight accounting so
+// the shared send-callback (audioOnSendCb) stays balanced.
+static void sendFleetBeacon(uint8_t param, uint8_t value) {
+    uint8_t pkt[4] = { 0xAC, 0x01, param, value };   // [1] = version 1, RELAYED=0
+    s_inflight++;
+    if (esp_now_send(BROADCAST_MAC, pkt, sizeof(pkt)) != ESP_OK) s_inflight--;
+}
+
+// Resend the set fleet params: burst ×3 on a change, then a single refresh every
+// 5 s (late-booting receivers catch up). Called from audioSourceLoop (loopTask).
+static void fleetTick() {
+    static uint32_t s_last = 0;
+    uint32_t now = millis();
+    bool burst = s_fleet_dirty;
+    if (!burst && (now - s_last) < 5000) return;
+    s_fleet_dirty = false;
+    s_last = now;
+    for (int r = 0; r < (burst ? 3 : 1); r++)
+        for (uint8_t pid = 1; pid <= 4; pid++)
+            if (s_fleet_set[pid]) sendFleetBeacon(pid, s_fleet_val[pid]);
+}
+
+// Public (serial set_fleet_param): 1=buffer_ms 2=selection 3=lock_timeout(×10ms)
+// 4=resync_gap. Stores the value + triggers a ×3 burst; then resent every 5 s.
+void audioSourceSetFleetParam(int param, int value) {
+    if (param < 1 || param > 4 || value < 0 || value > 255) return;
+    s_fleet_val[param] = (uint8_t)value;
+    s_fleet_set[param] = true;
+    s_fleet_dirty      = true;
+    Serial.printf("[AUDIO-SRC] fleet param %d = %d (burst + 5s resend)\n", param, value);
+}
+
+// Public (serial set_range_mode): persist RANGE + reboot into it (CoreS3-only —
+// the LR profile is Opus).
+void audioSourceSetRange(bool long_range) {
+#ifndef BOARD_CORES3
+    (void)long_range;
+    Serial.println("[AUDIO-SRC] set_range_mode ignored — LONGRANGE needs CoreS3 (Opus)");
+#else
+    Preferences p; p.begin("tx", false);
+    p.putBool("range_long", long_range);
+    p.end();
+    Serial.printf("[AUDIO-SRC] RANGE -> %s, rebooting\n", long_range ? "LONG" : "NORMAL");
+    delay(150);
+    ESP.restart();
+#endif
+}
+
+// Public (serial set_lr_bitrate): persist the LR-profile bitrate (24/32/48k) +
+// reboot (the Opus encoder is init-once per boot, so a live change is unsafe).
+void audioSourceSetLrBitrate(int bitrate) {
+    if (bitrate != 24000 && bitrate != 32000 && bitrate != 48000) return;
+    Preferences p; p.begin("tx", false);
+    p.putUShort("lr_bitrate", (uint16_t)bitrate);
+    p.end();
+    Serial.printf("[AUDIO-SRC] LR bitrate -> %d bps, rebooting\n", bitrate);
+    delay(150);
+    ESP.restart();
+}
+
+bool audioSourceGetRange()     { return s_range_long; }
+int  audioSourceGetLrBitrate() { return s_lr_bitrate; }
+
 void audioSourceLoop() {
     heartbeatTick();
+    fleetTick();
 
 #ifdef BOARD_CORES3
     // Hierarchical touch UI (HOME → MODE / CHANNEL). Capture/encode/send run in
@@ -1251,6 +1359,10 @@ void audioSourceApplyInputLevel(int level) {
 // decimate/encode path also lives in the CoreS3-only audioRxTask (the classic
 // loop always ships mode 0).
 void audioSourceSetMode(int mode) {
+    if (s_range_long) {
+        Serial.println("[AUDIO-SRC] mode change ignored — RANGE=LONG pins the LR profile");
+        return;
+    }
     if (mode < 0 || mode >= MODE_COUNT) return;
 #ifndef BOARD_CORES3
     if (mode != MODE_ADPCM) return;   // classic sender has no Opus encoder
