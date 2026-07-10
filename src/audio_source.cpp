@@ -1084,11 +1084,25 @@ static void uiRepaint() {
         d.setTextColor(TFT_DARKGREY, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_right);  d.drawString(hd, 314, 6);
         d.setTextDatum(textdatum_t::top_left);
+        // RANGE badge (tappable, y 25..42) — toggles NORMAL <-> LONGRANGE (reboots).
+        {
+            char rb[24];
+            if (s_range_long) snprintf(rb, sizeof(rb), "RANGE: LONG %uk", s_lr_bitrate / 1000);
+            else              snprintf(rb, sizeof(rb), "RANGE: NORMAL");
+            d.drawRoundRect(4, 25, 200, 17, 4, TFT_DARKCYAN);
+            d.setTextSize(1); d.setTextColor(s_range_long ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+            d.drawString(rb, 10, 29);
+        }
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString("MODE", 8, 44);
+        // While LONG the wire borrows id3 but it's the LR profile — show "LR", not
+        // "SMOOTH" (§7.3), so the operator doesn't confuse it with the audio mode.
         d.setTextSize(3); d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
-        d.drawString(MODE_NAME[m], 8, 58);
-        d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString(MODE_DESC[m], 8, 96);
-        d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.drawString(MODE_FMT[m], 8, 120);
+        d.drawString(s_range_long ? "LR" : MODE_NAME[m], 8, 58);
+        d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.drawString(s_range_long ? "Opus 8k mono" : MODE_DESC[m], 8, 96);
+        d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        if (s_range_long) { char fb[20]; snprintf(fb, sizeof(fb), "%u kbps pb1", s_lr_bitrate / 1000); d.drawString(fb, 8, 120); }
+        else              d.drawString(MODE_FMT[m], 8, 120);
         // Input-level meter frame + header (static; bars/readouts in uiUpdateHome).
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("INPUT PEAK", MTR_X, 44);
@@ -1190,6 +1204,10 @@ static void uiUpdateHome() {
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
     if (s_ui == UI_HOME) {
+        if (y >= 25 && y <= 42 && x <= 204) {           // RANGE badge → toggle NORMAL/LONG
+            audioSourceSetRange(!s_range_long);          // persists + reboots (CoreS3)
+            return;
+        }
         if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
