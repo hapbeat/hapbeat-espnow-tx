@@ -1145,10 +1145,14 @@ static void uiRepaint() {
         d.setTextDatum(textdatum_t::top_left);
         d.drawString("pkt/s", 48, 210);
         d.drawString("drop", 122, 210);
-        // 3 drill-in buttons: MODE / CH / RX VOL (receiver volume-max, §3.5 p5).
-        uiBtn(6,   148, 100, 48, "MODE >",   TFT_DARKCYAN, TFT_CYAN, false);
-        uiBtn(110, 148,  60, 48, "CH >",     TFT_DARKCYAN, TFT_CYAN, false);
-        uiBtn(174, 148, 140, 48, "RX VOL >", TFT_DARKCYAN, TFT_CYAN, false);
+        // Main drill-in buttons — unchanged full-size MODE / CHANNEL.
+        uiBtn(10, 148, 140, 48, "MODE >", TFT_DARKCYAN, TFT_CYAN, false);
+        uiBtn(170, 148, 140, 48, "CHANNEL >", TFT_DARKCYAN, TFT_CYAN, false);
+        // RX VOL (receiver volume-max, §3.5 p5) — a small, LOW-KEY button tucked
+        // into the bottom-right corner (dim grey, half height) so it doesn't
+        // compete with MODE/CHANNEL (user 2026-07-11). Bottom-right is free: the
+        // meter is top-right, the pkt/s·drop stats are bottom-left.
+        uiBtn(232, 206, 82, 30, "RX VOL", TFT_DARKGREY, TFT_DARKCYAN, false);
     } else if (s_ui == UI_FAMILY) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
@@ -1286,12 +1290,11 @@ static void uiUpdateHome() {
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
     if (s_ui == UI_HOME) {
-        // HOME drill-in buttons: MODE (x<108) / CH (<172) / RX VOL (else).
-        // RANGE is chosen via MODE > SELECT TYPE > LONG RANGE (badge display-only).
-        if (y >= 148 && y <= 196) {
-            s_ui = (x < 108) ? UI_FAMILY : (x < 172) ? UI_CH : UI_VOLMAX;
-            s_uiDirty = true;
-        }
+        // Main buttons (y148-196): MODE (x<160) / CHANNEL (else). RANGE is chosen
+        // via MODE > SELECT TYPE > LONG RANGE (badge display-only).
+        if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
+        // Small RX VOL button, bottom-right corner (below the main button row).
+        else if (y >= 200 && x >= 220) { s_ui = UI_VOLMAX; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
         if (y >= 54 && y <= 204) {                                  // three family cells
