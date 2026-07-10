@@ -300,8 +300,22 @@ void repeaterSetup() {
         p.end();
     }
 
-    // Apply channel (EspNowSender.init() already called WiFi.mode + esp_now_init).
-    esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
+    // Apply channel (EspNowSender.init() already called WiFi.mode + esp_now_init
+    // and locked the channel). Re-assert with a verify-loop so the final radio
+    // channel is guaranteed regardless of ordering — a repeater on the wrong
+    // channel silently relays nothing (same random-boot race as the receiver,
+    // user 2026-07-11).
+    {
+        uint8_t prim = 0;
+        wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+        int tries = 0;
+        for (; tries < 8; tries++) {
+            esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE);
+            delay(10);
+            if (esp_wifi_get_channel(&prim, &sec) == ESP_OK && prim == s_channel) break;
+        }
+        Serial.printf("[REPEATER] channel locked to %u (radio=%u, tries=%d)\n", s_channel, prim, tries + 1);
+    }
     WiFi.setSleep(false);   // no modem sleep → minimum relay latency
     esp_now_register_recv_cb(onReceiveCb);
 

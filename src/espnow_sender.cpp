@@ -129,6 +129,24 @@ bool EspNowSender::init() {
 #endif
 #endif
 
+    // Lock the channel with a verify-loop. The single set_channel above (before
+    // esp_now_init) can be undone by the WiFi STA startup sequence — the same
+    // "applied before init did not stick" caveat noted for the rate just above.
+    // A transmitter silently on the wrong channel means the WHOLE fleet stops
+    // receiving, so re-assert until esp_wifi_get_channel reports the target
+    // (the receiver has the identical guard; user 2026-07-11 random-boot RX bug).
+    {
+        uint8_t prim = 0;
+        wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+        int tries = 0;
+        for (; tries < 8; tries++) {
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            delay(10);
+            if (esp_wifi_get_channel(&prim, &sec) == ESP_OK && prim == channel) break;
+        }
+        log_i("ESP-NOW channel locked to %d (radio=%d, tries=%d)", channel, prim, tries + 1);
+    }
+
     initialized_ = true;
     log_i("ESP-NOW sender initialized");
     return true;
