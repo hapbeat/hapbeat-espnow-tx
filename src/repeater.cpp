@@ -43,7 +43,8 @@
 #include <cstring>
 #include <cstdio>
 
-static const uint8_t  STREAM_TYPE         = 0xAA;
+static const uint8_t  STREAM_TYPE         = 0xAA;   // audio stream packet
+static const uint8_t  FLEET_TYPE          = 0xAC;   // fleet-tune beacon (§3.5, 4 B)
 static const uint32_t DISPLAY_INTERVAL_MS = 250;   // ~4 fps (M5 LCD)
 static const uint32_t R_TIMEOUT_MS        = 250;   // origin silence → release (MUST > receiver LOCK_TIMEOUT 150)
 static const uint32_t HEARTBEAT_MS        = 2000;  // serial heartbeat cadence
@@ -82,7 +83,12 @@ static void macToStr(const uint8_t* mac, char* buf, size_t bufsz) {
 // ---- relay logic (called from the WiFi task — do NOT esp_now_send here) -----
 // `src` is the 6-byte sender MAC (both callback signatures resolve to this).
 static void onReceiveCbBody(const uint8_t* src, const uint8_t* data, int len) {
-    if (len < 5 || len > 250 || data[0] != STREAM_TYPE) return;
+    // Relay the audio stream (0xAA, >=5 B) AND the fleet-tune beacon (0xAC, 4 B).
+    // Both carry the RELAYED flag in byte[1] bit7 (DEC-043 §3.5 / §7.2), so the
+    // set-bit7 + no-relay-relayed 1-hop logic below is identical for either.
+    bool is_stream = (len >= 5 && len <= 250 && data[0] == STREAM_TYPE);
+    bool is_fleet  = (len == 4 && data[0] == FLEET_TYPE);
+    if (!is_stream && !is_fleet) return;
     if (data[1] & 0x80) return;                    // RELAYED already set → never relay (1-hop cap)
 
     if (s_pin_active) {                            // strict manual pin

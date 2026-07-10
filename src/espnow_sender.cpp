@@ -54,8 +54,17 @@ bool EspNowSender::init() {
 #else
     esp_wifi_set_max_tx_power(84);                  // S3 / classic ESP32 (~21 dBm)
 #endif
+#ifdef REPEATER
+    // Repeater carries bgn+LR always so it can receive (and relay) a RANGE=LONG
+    // (802.11 LR) origin as well as ordinary 6M origins (DEC-043 P5 §7.3). Its own
+    // relay TX rate stays 6M here; matching the origin's LR rate is a RANGE-toggle
+    // refinement (auto-follow on C6 rx_ctrl / NVS toggle on M5).
+    esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+#else
     esp_wifi_set_protocol(WIFI_IF_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
     esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 #if defined(AUDIO_SOURCE) || defined(REPEATER)
     // Live audio stream: 6 Mbps OFDM. ~150 µs airtime per 49 B packet lifts the
