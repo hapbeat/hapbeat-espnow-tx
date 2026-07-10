@@ -138,6 +138,7 @@ static void handleLine(const char* line) {
 #ifdef AUDIO_SOURCE
         // LONGRANGE state (DEC-043 P5). Only the live audio source carries it.
         r["range"]      = audioSourceGetRange() ? "long" : "normal";
+        r["lr_preset"]  = audioSourceGetLrPreset();
         r["lr_bitrate"] = audioSourceGetLrBitrate();
 #endif
 
@@ -220,7 +221,20 @@ static void handleLine(const char* line) {
         audioSourceSetRange(lng);
         return;
     }
-    // set_lr_bitrate {"bitrate":24000|32000|48000} → NVS + reboot (LR profile).
+    // set_lr_preset {"preset":0..5} → enter LONGRANGE with an LR preset + reboot
+    // (canonical; ECO/ECO-SAFE/STD/STD-SAFE/HQ/HQ-SAFE).
+    if (strcmp(cmd, "set_lr_preset") == 0) {
+        int pr = doc["preset"] | -1;
+        if (pr < 0 || pr > 5) {
+            r["status"] = "error"; r["cmd"] = cmd; r["message"] = "preset must be 0..5";
+            sendResp(r); return;
+        }
+        r["status"] = "ok"; r["cmd"] = cmd; r["preset"] = pr;
+        sendResp(r);
+        audioSourceSetLrPreset(pr);
+        return;
+    }
+    // set_lr_bitrate {"bitrate":24000|32000|48000} → deprecated alias → set_lr_preset.
     if (strcmp(cmd, "set_lr_bitrate") == 0) {
         int br = doc["bitrate"] | 24000;
         if (br != 24000 && br != 32000 && br != 48000) {

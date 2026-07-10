@@ -159,15 +159,28 @@ static_assert(OPUS_MAX_SMP >= 160, "OPUS_MAX_SMP must hold the largest MODE_DEFS
 // Live-selectable current mode (NVS "tx"/"mode", default 0 = ADPCM known-good).
 static volatile uint8_t s_mode = MODE_ADPCM;
 
-// ---- LONGRANGE profile (DEC-043 P5 §7.3) ----------------------------------
+// ---- LONGRANGE profile + presets (DEC-043 P5 §7.3 / LR-family-ui) ----------
 // RANGE=LONG (NVS tx/range_long) switches the radio to 802.11 LR / LORA_500K and
 // pins the stream to the "LR profile": mode_id 3 (SMOOTH wire = Opus 8k mono
-// 10 ms) at a low, field-adjustable bitrate (NVS tx/lr_bitrate — 24/32/48k) + pb1.
-// The wire stays id3, so receivers/repeaters need no change (Opus self-describing;
-// bitrate too). CoreS3-only (Opus). The sender UI labels it "LR", not "SMOOTH".
+// 10 ms). The exact bitrate/pb/buffer come from one of 6 presets (grid =
+// quality×stability). The wire stays id3, so receivers/repeaters need NO change:
+// bitrate is Opus-self-describing, pb travels in the wire pb_count, and the
+// per-preset receiver buffer depth is distributed by a 0xAC param-1 beacon at boot.
 static bool          s_range_long = false;
-static uint16_t      s_lr_bitrate = 24000;
 static const uint8_t LR_MODE      = MODE_Q;   // id 3 = SMOOTH wire host
+
+struct LrPreset { uint16_t bitrate; uint8_t pb; uint8_t buffer_ms; bool two_src; const char* name; };
+static const LrPreset LR_PRESET[6] = {
+    { 24000, 1, 16, true,  "ECO" },       // r0c0  ~17% duty, 2 src
+    { 24000, 2, 40, true,  "ECO-SAFE" },  // r0c1  ~22% duty, 2 src (default — far-field)
+    { 32000, 1, 16, true,  "STD" },       // r1c0  ~20% duty, 2 src
+    { 32000, 2, 40, false, "STD-SAFE" },  // r1c1  ~27% duty, 1 src
+    { 48000, 1, 24, false, "HQ" },        // r2c0  ~26% duty, 1 src
+    { 48000, 2, 40, false, "HQ-SAFE" },   // r2c1  ~37% duty, 1 src
+};
+static const uint8_t LR_PRESET_COUNT   = 6;
+static const uint8_t LR_PRESET_DEFAULT = 1;   // ECO-SAFE
+static uint8_t s_lr_preset = LR_PRESET_DEFAULT;   // NVS tx/lr_preset
 
 // ---- Fleet-tune (0xAC beacon, §3.5) ---------------------------------------
 // Operator-set runtime overrides broadcast to every receiver. Set via serial
@@ -561,9 +574,10 @@ static void opusEncoderConfig(uint8_t mode) {
                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_enc) { Serial.println("[AUDIO-SRC] opus enc alloc FAILED"); return; }
         opus_encoder_init(s_enc, rate, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY);
-        // RANGE=LONG on the id3 host uses the field-adjustable LR bitrate (§7.3),
-        // not MODE_DEFS[3]'s 60k — a low bitrate is what makes LR 2-source-viable.
-        uint32_t br = (s_range_long && mode == LR_MODE) ? s_lr_bitrate : MODE_DEFS[mode].bitrate;
+        // RANGE=LONG on the id3 host uses the preset's low bitrate (§7.3), not
+        // MODE_DEFS[3]'s 60k — a low bitrate is what makes LR 2-source-viable.
+        uint32_t br = (s_range_long && mode == LR_MODE) ? LR_PRESET[s_lr_preset].bitrate
+                                                        : MODE_DEFS[mode].bitrate;
         opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(br));
         opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(MODE_DEFS[mode].complexity));
         opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
@@ -581,8 +595,9 @@ static void opusEncoderConfig(uint8_t mode) {
 // Body: [4]=opus_len(1) [5..]=frame ; then pb× [prev_seq(1)][len(1)][data].
 static void sendOpusPacket(const uint8_t* frame, int flen) {
     uint8_t mode = s_mode;
-    // RANGE=LONG drops piggyback to 1 (§7.3) to trim the LR airtime budget.
-    int depth = (s_range_long && mode == LR_MODE) ? 1 : MODE_DEFS[mode].piggyback;
+    // RANGE=LONG uses the LR preset's piggyback (§7.3) to trim the airtime budget.
+    int depth = (s_range_long && mode == LR_MODE) ? LR_PRESET[s_lr_preset].pb
+                                                  : MODE_DEFS[mode].piggyback;
     int pbn   = s_opHistN < depth ? s_opHistN : depth;
 
     if (s_inflight >= STREAM_MAX_INFLIGHT) {
@@ -871,7 +886,8 @@ void audioSourceSetup() {
         s_mode        = p.getUChar("mode", MODE_ADPCM);
         if (s_mode >= MODE_COUNT) s_mode = MODE_ADPCM;
         s_range_long  = p.getBool("range_long", false);
-        s_lr_bitrate  = p.getUShort("lr_bitrate", 24000);
+        s_lr_preset   = p.getUChar("lr_preset", LR_PRESET_DEFAULT);
+        if (s_lr_preset >= LR_PRESET_COUNT) s_lr_preset = LR_PRESET_DEFAULT;
         p.end();
     }
 #ifdef BOARD_CORES3
@@ -894,8 +910,12 @@ void audioSourceSetup() {
         esp_wifi_set_protocol(WIFI_IF_STA,
             WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
         esp_err_t re = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_500K);
-        Serial.printf("[AUDIO-SRC] RANGE=LONG: LR/LORA_500K rc=%d, profile id%u %u bps pb1\n",
-                      (int)re, LR_MODE, s_lr_bitrate);
+        const LrPreset& pr = LR_PRESET[s_lr_preset];
+        Serial.printf("[AUDIO-SRC] RANGE=LONG preset=%s (id%u %u bps pb%u buf%ums) LR rc=%d\n",
+                      pr.name, LR_MODE, pr.bitrate, pr.pb, pr.buffer_ms, (int)re);
+        // Distribute this preset's receiver jitter-buffer depth to the whole fleet
+        // via a 0xAC param-1 beacon (auto ×3 + 5 s resend). Receivers need no reflash.
+        audioSourceSetFleetParam(1, pr.buffer_ms);
     }
 #endif
 
@@ -1008,17 +1028,26 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
 // ---- Two-level mode picker: family (ADPCM / OPUS) -> mode within it --------
 // The wire mode_id is unchanged; this only groups the on-screen selector so the
 // 3x2 grid never needs a 4th row (ADPCM has 3 modes, OPUS has 6 — both fit the 3×2 grid).
-enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_COUNT = 2 };
-static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS" };
-static const char* const FAM_HINT[FAM_COUNT] = { "low latency", "quality" };
+enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_LR = 2, FAM_COUNT = 3 };
+static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS", "LONG RANGE" };
+// Hints describe what the family optimises for — NOT latency/quality, which are
+// per-tile axes within a family (user 2026-07-10): ADPCM has SOLID=30 ms while
+// Opus FAST=12 ms, and the top sensory quality is SOLID/ADPCM. ADPCM = simple,
+// zero encode-CPU, proven (but higher airtime + silence-fill loss); OPUS =
+// bandwidth-efficient (multi-source) + PLC (loss concealment); LR = distance.
+static const char* const FAM_HINT[FAM_COUNT] = { "simple / proven", "efficient / PLC", "distance" };
 static const uint8_t FAM_ADPCM_MODES[] = { MODE_TURBO, MODE_MONO8K, MODE_ADPCM };      // TURBO, LITE, SOLID (low-latency -> robust)
 static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_FINE, MODE_STEREO, MODE_HIFI }; // FAST, BALANCED, SMOOTH, FINE, STEREO, HIFI (low-latency -> high-quality)
 struct FamilyDef { const uint8_t* modes; uint8_t count; };
 static const FamilyDef FAMILY[FAM_COUNT] = {
     { FAM_ADPCM_MODES, 3 },
     { FAM_OPUS_MODES,  6 },
+    { nullptr,         LR_PRESET_COUNT },   // LONG RANGE grid renders LR_PRESET[], not modes
 };
+// Reverse-map the wire mode → family for highlighting. RANGE=LONG borrows wire
+// id3 but its family is LONG RANGE, so s_range_long wins.
 static inline uint8_t familyOf(uint8_t mode) {
+    if (s_range_long) return FAM_LR;
     return (mode == MODE_ADPCM || mode == MODE_MONO8K || mode == MODE_TURBO) ? FAM_ADPCM : FAM_OPUS;
 }
 static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
@@ -1084,24 +1113,24 @@ static void uiRepaint() {
         d.setTextColor(TFT_DARKGREY, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_right);  d.drawString(hd, 314, 6);
         d.setTextDatum(textdatum_t::top_left);
-        // RANGE badge (tappable, y 25..42) — toggles NORMAL <-> LONGRANGE (reboots).
+        // RANGE badge (display-only now — RANGE is chosen in MODE > SELECT TYPE >
+        // LONG RANGE; the badge just reflects the current state).
         {
-            char rb[24];
-            if (s_range_long) snprintf(rb, sizeof(rb), "RANGE: LONG %uk", s_lr_bitrate / 1000);
+            char rb[28];
+            if (s_range_long) snprintf(rb, sizeof(rb), "RANGE: LONG (%s)", LR_PRESET[s_lr_preset].name);
             else              snprintf(rb, sizeof(rb), "RANGE: NORMAL");
-            d.drawRoundRect(4, 25, 200, 17, 4, TFT_DARKCYAN);
             d.setTextSize(1); d.setTextColor(s_range_long ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
-            d.drawString(rb, 10, 29);
+            d.drawString(rb, 8, 30);
         }
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.drawString("MODE", 8, 44);
-        // While LONG the wire borrows id3 but it's the LR profile — show "LR", not
-        // "SMOOTH" (§7.3), so the operator doesn't confuse it with the audio mode.
+        // LONG borrows wire id3 but it is an LR preset — show "LR" + preset name +
+        // format, not "SMOOTH", so the operator never confuses it with the mode.
         d.setTextSize(3); d.setTextColor(s_codecOk ? TFT_WHITE : TFT_RED, TFT_BLACK);
         d.drawString(s_range_long ? "LR" : MODE_NAME[m], 8, 58);
         d.setTextSize(2); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        d.drawString(s_range_long ? "Opus 8k mono" : MODE_DESC[m], 8, 96);
+        d.drawString(s_range_long ? LR_PRESET[s_lr_preset].name : MODE_DESC[m], 8, 96);
         d.setTextSize(2); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        if (s_range_long) { char fb[20]; snprintf(fb, sizeof(fb), "%u kbps pb1", s_lr_bitrate / 1000); d.drawString(fb, 8, 120); }
+        if (s_range_long) { char fb[24]; snprintf(fb, sizeof(fb), "8k mono 10ms %uk", LR_PRESET[s_lr_preset].bitrate / 1000); d.drawString(fb, 8, 120); }
         else              d.drawString(MODE_FMT[m], 8, 120);
         // Input-level meter frame + header (static; bars/readouts in uiUpdateHome).
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -1120,17 +1149,29 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
         uint8_t curFam = familyOf(m);
+        // 3 cells now (ADPCM / OPUS / LONG RANGE) — narrower than the old 2-cell
+        // layout so all three fit; the two-word "LONG RANGE" name wraps to 2 lines.
         for (int f = 0; f < FAM_COUNT; f++) {
-            int x = 10 + f * 160, y = 54, w = 140, h = 150;
+            int x = 6 + f * 104, y = 54, w = 98, h = 150;
+            int mx = x + w / 2, my = y + h / 2;
             bool cur = (f == curFam);
             uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
             if (cur) d.fillRoundRect(x, y, w, h, 8, UI_SEL_BG);
             d.drawRoundRect(x, y, w, h, 8, cur ? TFT_CYAN : TFT_DARKCYAN);
             d.setTextDatum(textdatum_t::middle_center);
-            d.setTextSize(3); d.setTextColor(cur ? TFT_WHITE : TFT_CYAN, bg);
-            d.drawString(FAM_NAME[f], x + w / 2, y + h / 2 - 14);
+            d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_CYAN, bg);
+            const char* nm = FAM_NAME[f];
+            const char* sp = strchr(nm, ' ');
+            if (sp) {  // two-word name (LONG RANGE) → 2 lines
+                char w1[12]; size_t n1 = (size_t)(sp - nm); if (n1 > 11) n1 = 11;
+                memcpy(w1, nm, n1); w1[n1] = 0;
+                d.drawString(w1, mx, my - 26);
+                d.drawString(sp + 1, mx, my - 6);
+            } else {
+                d.drawString(nm, mx, my - 14);
+            }
             d.setTextSize(1); d.setTextColor(TFT_DARKGREY, bg);
-            d.drawString(FAM_HINT[f], x + w / 2, y + h / 2 + 16);
+            d.drawString(FAM_HINT[f], mx, my + 24);
         }
         d.setTextDatum(textdatum_t::top_left);
     } else if (s_ui == UI_MODE) {
@@ -1138,21 +1179,36 @@ static void uiRepaint() {
         d.setTextDatum(textdatum_t::top_left);
         char hdr[24]; snprintf(hdr, sizeof(hdr), "< %s", FAM_NAME[s_uiFamily]);
         d.drawString(hdr, 6, 6);
-        const FamilyDef& fam = FAMILY[s_uiFamily];
-        for (int i = 0; i < fam.count; i++) {
-            uint8_t mode = fam.modes[i];
+        // The LONG RANGE family renders LR presets (bitrate + 2SRC/1SRC); the
+        // others render wire modes. Same 3×2 geometry.
+        bool isLr  = (s_uiFamily == FAM_LR);
+        int  count = isLr ? LR_PRESET_COUNT : FAMILY[s_uiFamily].count;
+        for (int i = 0; i < count; i++) {
             int col = i & 1, row = i >> 1;
             int x = UI_MODE_X0 + col * UI_MODE_COLP;
             int y = UI_MODE_Y0 + row * UI_MODE_ROWP;
-            bool cur = (mode == m);
+            const char* nm; char desc[24]; bool cur;
+            if (isLr) {
+                nm  = LR_PRESET[i].name;
+                cur = (s_range_long && i == s_lr_preset);
+                snprintf(desc, sizeof(desc), "%uk  %s", LR_PRESET[i].bitrate / 1000,
+                         LR_PRESET[i].two_src ? "2SRC" : "1SRC");
+            } else {
+                uint8_t mode = FAMILY[s_uiFamily].modes[i];
+                nm  = MODE_NAME[mode];
+                cur = (!s_range_long && mode == m);
+                strncpy(desc, MODE_DESC[mode], sizeof(desc)); desc[sizeof(desc) - 1] = 0;
+            }
             uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
             if (cur) d.fillRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, UI_SEL_BG);
             d.drawRoundRect(x, y, UI_MODE_COLW, UI_MODE_CELLH, 6, cur ? TFT_CYAN : TFT_DARKGREY);
             d.setTextDatum(textdatum_t::top_left);
             d.setTextSize(2); d.setTextColor(cur ? TFT_WHITE : TFT_LIGHTGREY, bg);
-            d.drawString(MODE_NAME[mode], x + 10, y + 8);
-            d.setTextSize(1); d.setTextColor(TFT_DARKGREY, bg);
-            d.drawString(MODE_DESC[mode], x + 10, y + 38);
+            d.drawString(nm, x + 10, y + 8);
+            // 2SRC presets shown green (operator judges 2-source viability on screen).
+            d.setTextSize(1);
+            d.setTextColor(isLr && LR_PRESET[i].two_src ? TFT_GREEN : TFT_DARKGREY, bg);
+            d.drawString(desc, x + 10, y + 38);
         }
         d.setTextDatum(textdatum_t::top_left);
     } else {  // UI_CH
@@ -1204,18 +1260,16 @@ static void uiUpdateHome() {
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
     if (s_ui == UI_HOME) {
-        if (y >= 25 && y <= 42 && x <= 204) {           // RANGE badge → toggle NORMAL/LONG
-            audioSourceSetRange(!s_range_long);          // persists + reboots (CoreS3)
-            return;
-        }
+        // RANGE is now chosen via MODE > SELECT TYPE > LONG RANGE (the HOME badge
+        // is display-only), so HOME only has the MODE / CHANNEL buttons.
         if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
-        if (y >= 54 && y <= 204) {                                  // two family cells
-            int f = -1;
-            if (x >= 10 && x < 150)       f = FAM_ADPCM;
-            else if (x >= 170 && x < 310) f = FAM_OPUS;
-            if (f >= 0) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; }
+        if (y >= 54 && y <= 204) {                                  // three family cells
+            for (int f = 0; f < FAM_COUNT; f++) {
+                int cx0 = 6 + f * 104;
+                if (x >= cx0 && x < cx0 + 98) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; break; }
+            }
         }
     } else if (s_ui == UI_MODE) {
         if (y < 36) { s_ui = UI_FAMILY; s_uiDirty = true; return; } // header = back to family
@@ -1228,8 +1282,12 @@ static void uiTouch(int x, int y) {
         int cy = y - (UI_MODE_Y0 + row * UI_MODE_ROWP);
         if (cx >= UI_MODE_COLW || cy < 0 || cy >= UI_MODE_CELLH) return;
         int i = row * 2 + col;
-        const FamilyDef& fam = FAMILY[s_uiFamily];
-        if (i >= 0 && i < fam.count) audioSourceSetMode(fam.modes[i]);  // saves NVS + reboots
+        if (s_uiFamily == FAM_LR) {
+            if (i >= 0 && i < LR_PRESET_COUNT) audioSourceSetLrPreset(i);   // saves NVS + reboots
+        } else {
+            const FamilyDef& fam = FAMILY[s_uiFamily];
+            if (i >= 0 && i < fam.count) audioSourceSetMode(fam.modes[i]);  // saves NVS + reboots
+        }
     } else {  // UI_CH
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
         if (y >= 90 && y <= 152) {
@@ -1279,8 +1337,8 @@ void audioSourceSetFleetParam(int param, int value) {
     Serial.printf("[AUDIO-SRC] fleet param %d = %d (burst + 5s resend)\n", param, value);
 }
 
-// Public (serial set_range_mode): persist RANGE + reboot into it (CoreS3-only —
-// the LR profile is Opus).
+// Public (serial set_range_mode): persist RANGE (keeps the current LR preset) +
+// reboot into it (CoreS3-only — the LR profile is Opus).
 void audioSourceSetRange(bool long_range) {
 #ifndef BOARD_CORES3
     (void)long_range;
@@ -1289,26 +1347,41 @@ void audioSourceSetRange(bool long_range) {
     Preferences p; p.begin("tx", false);
     p.putBool("range_long", long_range);
     p.end();
-    Serial.printf("[AUDIO-SRC] RANGE -> %s, rebooting\n", long_range ? "LONG" : "NORMAL");
+    Serial.printf("[AUDIO-SRC] RANGE -> %s (preset %s), rebooting\n",
+                  long_range ? "LONG" : "NORMAL", LR_PRESET[s_lr_preset].name);
     delay(150);
     ESP.restart();
 #endif
 }
 
-// Public (serial set_lr_bitrate): persist the LR-profile bitrate (24/32/48k) +
-// reboot (the Opus encoder is init-once per boot, so a live change is unsafe).
-void audioSourceSetLrBitrate(int bitrate) {
-    if (bitrate != 24000 && bitrate != 32000 && bitrate != 48000) return;
+// Public (serial set_lr_preset / MODE > LONG RANGE tile): enter LONGRANGE with an
+// LR preset (0..5) + persist + reboot. CoreS3-only (Opus).
+void audioSourceSetLrPreset(int preset) {
+#ifndef BOARD_CORES3
+    (void)preset;
+    Serial.println("[AUDIO-SRC] set_lr_preset ignored — LONGRANGE needs CoreS3 (Opus)");
+#else
+    if (preset < 0 || preset >= LR_PRESET_COUNT) return;
+    if (s_range_long && (uint8_t)preset == s_lr_preset) return;   // no change
     Preferences p; p.begin("tx", false);
-    p.putUShort("lr_bitrate", (uint16_t)bitrate);
+    p.putBool("range_long", true);
+    p.putUChar("lr_preset", (uint8_t)preset);
     p.end();
-    Serial.printf("[AUDIO-SRC] LR bitrate -> %d bps, rebooting\n", bitrate);
+    Serial.printf("[AUDIO-SRC] LR preset -> %s, rebooting\n", LR_PRESET[preset].name);
     delay(150);
     ESP.restart();
+#endif
 }
 
-bool audioSourceGetRange()     { return s_range_long; }
-int  audioSourceGetLrBitrate() { return s_lr_bitrate; }
+// Deprecated (serial set_lr_bitrate): compat alias mapping a raw bitrate to its
+// pb1 preset. set_lr_preset is canonical.
+void audioSourceSetLrBitrate(int bitrate) {
+    audioSourceSetLrPreset(bitrate == 48000 ? 4 : bitrate == 32000 ? 2 : 0);  // HQ / STD / ECO
+}
+
+bool        audioSourceGetRange()     { return s_range_long; }
+int         audioSourceGetLrBitrate() { return LR_PRESET[s_lr_preset].bitrate; }
+const char* audioSourceGetLrPreset()  { return LR_PRESET[s_lr_preset].name; }
 
 void audioSourceLoop() {
     heartbeatTick();
@@ -1377,18 +1450,17 @@ void audioSourceApplyInputLevel(int level) {
 // decimate/encode path also lives in the CoreS3-only audioRxTask (the classic
 // loop always ships mode 0).
 void audioSourceSetMode(int mode) {
-    if (s_range_long) {
-        Serial.println("[AUDIO-SRC] mode change ignored — RANGE=LONG pins the LR profile");
-        return;
-    }
     if (mode < 0 || mode >= MODE_COUNT) return;
 #ifndef BOARD_CORES3
     if (mode != MODE_ADPCM) return;   // classic sender has no Opus encoder
 #endif
-    if ((uint8_t)mode == s_mode) return;   // no change
+    // Picking an ADPCM/OPUS mode also EXITS LONGRANGE (§1). Skip only when the mode
+    // is unchanged AND we're already in NORMAL.
+    if ((uint8_t)mode == s_mode && !s_range_long) return;
     Preferences p;
     p.begin("tx", false);
     p.putUChar("mode", (uint8_t)mode);
+    p.putBool("range_long", false);   // exit LR back to NORMAL (6M)
     p.end();
     // Reboot into the new mode instead of live-switching. Re-initializing the
     // Opus encoder for a new frame size mid-stream is unreliable on this codec
