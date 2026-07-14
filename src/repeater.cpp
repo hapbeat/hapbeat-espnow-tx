@@ -74,8 +74,8 @@ static volatile uint8_t  s_last_mode   = 0xFF; // mode_id of the last relayed 0x
 
 // Compact mode-name table for the XIAO expansion-board OLED. Index = mode_id,
 // matching the receiver STREAM_MODE_NAME / sender MODE_NAME order.
-static const char* const RPT_MODE_NAME[9] = {
-    "SOLID", "FAST", "BALANCED", "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO", "FINE" };
+static const char* const RPT_MODE_NAME[10] = {
+    "SOLID", "FAST", "BALANCED", "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO", "FINE", "SOLID48" };
 
 // ---- 4-slot SPSC ring (lock-free, single producer = callback) --------------
 static const int SLOT_COUNT = 4;
@@ -209,7 +209,7 @@ static void xiaoOledDraw() {
     }
     s_oled.drawString(0, 2, line);
     uint8_t md = s_last_mode;
-    snprintf(line, sizeof(line), "mode:%-8s ", (md < 9) ? RPT_MODE_NAME[md] : "--");
+    snprintf(line, sizeof(line), "mode:%-8s ", (md < 10) ? RPT_MODE_NAME[md] : "--");
     s_oled.drawString(0, 3, line);
     snprintf(line, sizeof(line), "rly:%lu/s        ", (unsigned long)(pps > 9999 ? 9999 : pps));
     s_oled.drawString(0, 4, line);
@@ -358,7 +358,7 @@ void repeaterLoop() {
         char rssi_str[8];
         if (s_origin_rssi == 127) snprintf(rssi_str, sizeof(rssi_str), "n/a");
         else                      snprintf(rssi_str, sizeof(rssi_str), "%d", (int)s_origin_rssi);
-        const char* md = (s_last_mode < 9) ? RPT_MODE_NAME[s_last_mode] : "--";
+        const char* md = (s_last_mode < 10) ? RPT_MODE_NAME[s_last_mode] : "--";
         Serial.printf("[RPT] ch=%u relayed/s=%u drops=%u origin=%s pin=%d mode=%s rssi=%s\n",
                       s_channel, (unsigned)(d / (HEARTBEAT_MS / 1000)), (unsigned)s_slot_drops,
                       origin_str, s_pin_active ? 1 : 0, md, rssi_str);

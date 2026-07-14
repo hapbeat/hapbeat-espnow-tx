@@ -91,6 +91,7 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //   6 LITE     ADPCM  8k mono    40-smp(5ms)    pb3  zero-encode mono (CoreS3 8k path)
 //   7 TURBO    ADPCM  8k mono    40-smp(5ms)    pb3  same wire as LITE — 4ms RX buffer (min latency, drops-tolerant)
 //   8 FINE     OPUS  16k mono   160-smp(10ms)   pb2  mono full-band (16 kHz mono middle ground between SMOOTH and HIFI)
+//   9 SOLID48  OPUS  48k stereo 480-smp(10ms)   pb2  highest quality — full-band stereo, single-source use
 // Per-mode worst-case packet size vs the 250 B ESP-NOW limit (ESP_NOW_MAX_DATA_LEN):
 //   Opus body = type1+mode1+seq1+pbcnt1 + len1 + flen ; each pb entry = seq1+len1+flen.
 //     FAST/BAL  flen=30, pb3: 4 + 1 + 30 + 3*(2+30) = 131 B  <=250 ✓
@@ -98,17 +99,19 @@ static const uint8_t  STREAM_TYPE        = 0xAA;
 //     STEREO    flen=80, pb2: 4 + 1 + 80 + 2*(2+80) = 249 B  <=250 ✓ (at the limit)
 //     HIFI      flen=75, pb2: 4 + 1 + 75 + 2*(2+75) = 234 B  <=250 ✓
 //     FINE      flen=60, pb2: 4 + 1 + 60 + 2*(2+60) = 189 B  <=250 ✓ (16k mono @48kbps CBR)
+//     SOLID48   flen=80, pb2: 4 + 1 + 80 + 2*(2+80) = 249 B  <=250 ✓ (at the limit; 48k stereo @64kbps CBR)
 //   ADPCM body = type1+mode1+seq1+pbcnt1 + nf1 + state + data ; each pb entry = seq1+state+data.
 //     SOLID (mode0) 64-frame stereo: state6 + data64, pb1 (unchanged, ~148 B).
 //     LITE (mode6)/TURBO (mode7) 8k mono: state3 + data20, pb3: 4 + 1 + 3 + 20 + 3*(1+3+20) = 100 B  <=250 ✓
 // Opus modes are CoreS3-only (classic sender has no encoder → ADPCM only). Mode 6
 // (LITE / ADPCM 8k mono) and mode 7 (TURBO, same wire as LITE) are also CoreS3-only
 // — their decimate+encode path lives in audioRxTask; the classic loop always ships
-// mode 0 (16 kHz stereo ADPCM).
+// mode 0 (16 kHz stereo ADPCM). Mode 9 (SOLID48) bypasses the FIR/decimation path
+// entirely and streams the raw 48 kHz capture directly into Opus (see audioRxTask).
 enum StreamMode : uint8_t {
     MODE_ADPCM = 0, MODE_L = 1, MODE_M = 2, MODE_Q = 3,
     MODE_STEREO = 4, MODE_HIFI = 5, MODE_MONO8K = 6, MODE_TURBO = 7,
-    MODE_FINE = 8, MODE_COUNT = 9
+    MODE_FINE = 8, MODE_SOLID48 = 9, MODE_COUNT = 10
 };
 struct ModeDef {
     uint8_t  codec;       // 0 = ADPCM, 1 = OPUS
@@ -129,6 +132,7 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
     { 0,  8000, 1,  40, 3,     0, 0 },   // 6 LITE     ADPCM 8k mono   5 ms  pb3 (100 B; opus_frame=40 = mono samples/packet; codec 0 → bitrate/complexity unused)
     { 0,  8000, 1,  40, 3,     0, 0 },   // 7 TURBO    ADPCM 8k mono   5 ms  pb3 — identical wire to LITE (mode 6); only the RX jitter buffer differs (4ms vs 16ms)
     { 1, 16000, 1, 160, 2, 48000, 5 },   // 8 FINE     Opus 16k mono   10 ms  pb2 (189 B; mono full-band, between SMOOTH and HIFI)
+    { 1, 48000, 2, 480, 2, 64000, 1 },   // 9 SOLID48  Opus 48k stereo 10ms  pb2 (~249B @64k CBR — full-band stereo). complexity=1 is a REAL-TIME-SAFE default: 48k stereo has 3× HIFI's samples/frame, so c5 (~210% of the 10ms encode budget, est.) would starve the I2S RX. Measure the [AUDIO-SRC] enc-max us on HW; if <~7ms with headroom, raise toward 5 for quality. See DEC-046 G-A1.
 };
 // User-facing names (SOLID=ADPCM high-reliability baseline; FAST/BALANCED/SMOOTH=
 // Opus mono latency ladder; FINE=Opus 16k mono full-band; STEREO/HIFI=dual-channel
@@ -136,25 +140,27 @@ static const ModeDef MODE_DEFS[MODE_COUNT] = {
 // buffer for minimum latency).
 static const char*   MODE_NAME[MODE_COUNT] = { "SOLID", "FAST", "BALANCED",
                                                "SMOOTH", "STEREO", "HIFI", "LITE", "TURBO",
-                                               "FINE" };
+                                               "FINE", "SOLID48" };
 static const char*   MODE_DESC[MODE_COUNT] = { "ADPCM 30ms", "Opus 10ms",
                                                "Opus 15ms", "Opus 28ms",
                                                "Opus 18ms", "Opus 28ms", "ADPCM 8ms",
-                                               "ADPCM 4ms buf", "Opus 16k mono" };
+                                               "ADPCM 4ms buf", "Opus 16k mono",
+                                               "Opus 48k stereo" };
 // Audio format per mode (rate + channels), shown on the sender HOME screen.
 static const char*   MODE_FMT[MODE_COUNT]  = { "16kHz Stereo", "8kHz Mono",
                                                "8kHz Mono", "8kHz Mono",
                                                "8kHz Stereo", "16kHz Stereo",
                                                "8kHz Mono ADPCM",
                                                "8kHz Mono ADPCM",
-                                               "16kHz Mono" };
+                                               "16kHz Mono",
+                                               "48kHz Stereo" };
 static const int      OPUS_MAX_LEN         = 160;    // max opus frame bytes (headroom)
-static const int      OPUS_MAX_SMP         = 160;    // max samples/ch/frame (10 ms @16k)
+static const int      OPUS_MAX_SMP         = 480;    // max samples/ch/frame (10 ms @48k, SOLID48)
 // s_opusAccum is [OPUS_MAX_SMP*2] (per-channel × up to 2 ch). Guard that the
-// largest Opus frame in MODE_DEFS (HIFI = 160 samples/ch) still fits — if a
-// future mode raises opus_frame, bump OPUS_MAX_SMP or this fails to build
-// instead of silently overflowing the encoder input.
-static_assert(OPUS_MAX_SMP >= 160, "OPUS_MAX_SMP must hold the largest MODE_DEFS opus_frame");
+// largest Opus frame in MODE_DEFS (SOLID48 = 480 samples/ch @ 48 kHz) still
+// fits — if a future mode raises opus_frame, bump OPUS_MAX_SMP or this fails
+// to build instead of silently overflowing the encoder input.
+static_assert(OPUS_MAX_SMP >= 480, "OPUS_MAX_SMP must hold the largest MODE_DEFS opus_frame");
 
 // Live-selectable current mode (NVS "tx"/"mode", default 0 = ADPCM known-good).
 static volatile uint8_t s_mode = MODE_ADPCM;
@@ -628,11 +634,12 @@ static void opusEncoderConfig(uint8_t mode) {
     // pschatzmann's ALLOC_STACK keeps a non-NULL global_stack as-is, so THIS
     // buffer's size — not the library's GLOBAL_STACK_SIZE (60000) — is the real
     // ceiling. 8 kHz mono needed <64 KB; 16 kHz stereo (HIFI) uses more CELT
-    // scratch, so seed 96 KB internal (SRAM for fast encode; ~200 KB largest
-    // free block available) with a PSRAM fallback. An overflow here would be a
-    // silent heap corruption, so err toward headroom.
+    // scratch; 48 kHz stereo (SOLID48) is the new worst case, so seed 128 KB
+    // internal (SRAM for fast encode; ~200 KB largest free block available)
+    // with a PSRAM fallback. An overflow here would be a silent heap
+    // corruption, so err toward headroom.
     if (!global_stack) {
-        global_stack = (char*)heap_caps_malloc(96 * 1024,
+        global_stack = (char*)heap_caps_malloc(128 * 1024,
                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!global_stack)
             global_stack = (char*)heap_caps_malloc(160 * 1024, MALLOC_CAP_SPIRAM);
@@ -863,6 +870,19 @@ static void audioRxTask(void* /*arg*/) {
             int16_t L = rx[i + 1];
             int16_t R = rx[i];
             rawStat(L, R);
+            // Mode 9 (SOLID48): full 48 kHz stereo direct into Opus, bypassing the
+            // FIR decimation entirely. Checked here (before firPush/dcount) since
+            // the mode-switch/encoder-config block below only runs at the
+            // decimated-sample rate and would never fire for a mode that skips
+            // that gate on every sample — so this mode configures its own encoder
+            // once, on the first sample after boot. NOTE: the DC-blocker, R-trim,
+            // and UI level-meter live INSIDE the decimation gate below, so this
+            // mode streams raw (no DC-block/R-trim/meter) — acceptable for now.
+            if (s_mode == MODE_SOLID48) {
+                if (taskMode != MODE_SOLID48) { opusEncoderConfig(MODE_SOLID48); taskMode = MODE_SOLID48; }
+                opusPushSample(L, R);
+                continue;
+            }
             firPush(L, R);
             if (++dcount >= (uint32_t)DECIMATE) {
                 dcount = 0;
@@ -1129,29 +1149,44 @@ static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16
 // ---- Two-level mode picker: family (ADPCM / OPUS) -> mode within it --------
 // The wire mode_id is unchanged; this only groups the on-screen selector so the
 // 3x2 grid never needs a 4th row (ADPCM has 3 modes, OPUS has 6 — both fit the 3×2 grid).
-enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_LR = 2, FAM_COUNT = 3 };
-static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS", "LONG RANGE" };
+// SOLID48 (mode 9) is its own family (FAM_AUDIO) rather than a 7th OPUS tile:
+// OPUS already fills all 6 cells of the 3×2 MODE-select grid (FAST/BALANCED/
+// SMOOTH/FINE/STEREO/HIFI), so a 7th entry would render off-screen (row 3 at
+// y=234 > the 240 px panel height). A 1-entry family fits the grid trivially.
+enum { FAM_ADPCM = 0, FAM_OPUS = 1, FAM_LR = 2, FAM_AUDIO = 3, FAM_COUNT = 4 };
+static const char* const FAM_NAME[FAM_COUNT] = { "ADPCM", "OPUS", "LONG RANGE", "HIFI+" };
 // Hints describe what the family optimises for — NOT latency/quality, which are
 // per-tile axes within a family (user 2026-07-10): ADPCM has SOLID=30 ms while
 // Opus FAST=12 ms, and the top sensory quality is SOLID/ADPCM. ADPCM = simple,
 // zero encode-CPU, proven (but higher airtime + silence-fill loss); OPUS =
-// bandwidth-efficient (multi-source) + PLC (loss concealment); LR = distance.
-static const char* const FAM_HINT[FAM_COUNT] = { "simple / proven", "efficient / PLC", "distance" };
+// bandwidth-efficient (multi-source) + PLC (loss concealment); LR = distance;
+// HIFI+ = full-band 48 kHz stereo, the highest-quality mode (SOLID48).
+static const char* const FAM_HINT[FAM_COUNT] = { "simple / proven", "efficient / PLC", "distance", "full-band, max quality" };
 static const uint8_t FAM_ADPCM_MODES[] = { MODE_TURBO, MODE_MONO8K, MODE_ADPCM };      // TURBO, LITE, SOLID (low-latency -> robust)
 static const uint8_t FAM_OPUS_MODES[]  = { MODE_L, MODE_M, MODE_Q, MODE_FINE, MODE_STEREO, MODE_HIFI }; // FAST, BALANCED, SMOOTH, FINE, STEREO, HIFI (low-latency -> high-quality)
+static const uint8_t FAM_AUDIO_MODES[] = { MODE_SOLID48 };   // SOLID48 — Opus 48k stereo, highest quality
 struct FamilyDef { const uint8_t* modes; uint8_t count; };
 static const FamilyDef FAMILY[FAM_COUNT] = {
     { FAM_ADPCM_MODES, 3 },
     { FAM_OPUS_MODES,  6 },
     { nullptr,         LR_PRESET_COUNT },   // LONG RANGE grid renders LR_PRESET[], not modes
+    { FAM_AUDIO_MODES, 1 },
 };
 // Reverse-map the wire mode → family for highlighting. RANGE=LONG borrows wire
 // id3 but its family is LONG RANGE, so s_range_long wins.
 static inline uint8_t familyOf(uint8_t mode) {
     if (s_range_long) return FAM_LR;
+    if (mode == MODE_SOLID48) return FAM_AUDIO;
     return (mode == MODE_ADPCM || mode == MODE_MONO8K || mode == MODE_TURBO) ? FAM_ADPCM : FAM_OPUS;
 }
 static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
+// SELECT-TYPE (UI_FAMILY) grid geometry — generalized from the old hardcoded
+// 3-cell layout (x = 6 + f*104, w = 98) so a 4th (or Nth) family still fits the
+// ~320 px panel width: for FAM_COUNT=3 this reproduces the exact prior pixel
+// values (98 W / 104 pitch); for FAM_COUNT=4 it yields 72 W / 78 pitch.
+// Shared by render (uiRepaint) + touch hit-test (uiTouch).
+static const int UI_FAM_W = (308 - (FAM_COUNT - 1) * 6) / FAM_COUNT;   // cell width
+static const int UI_FAM_P = UI_FAM_W + 6;                               // pitch (x stride)
 
 // MODE-select 3×2 grid geometry — row-major, i = row*2 + col (e.g. the OPUS
 // family fills FAST|BALANCED / SMOOTH|FINE / STEREO|HIFI). Larger cells than the old 6-row list to stop
@@ -1256,10 +1291,11 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
         uint8_t curFam = familyOf(m);
-        // 3 cells now (ADPCM / OPUS / LONG RANGE) — narrower than the old 2-cell
-        // layout so all three fit; the two-word "LONG RANGE" name wraps to 2 lines.
+        // FAM_COUNT cells (ADPCM / OPUS / LONG RANGE / HIFI+) sized by
+        // UI_FAM_W/UI_FAM_P so they always fit the panel width; the two-word
+        // "LONG RANGE" name wraps to 2 lines.
         for (int f = 0; f < FAM_COUNT; f++) {
-            int x = 6 + f * 104, y = 54, w = 98, h = 150;
+            int x = 6 + f * UI_FAM_P, y = 54, w = UI_FAM_W, h = 150;
             int mx = x + w / 2, my = y + h / 2;
             bool cur = (f == curFam);
             uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
@@ -1396,10 +1432,10 @@ static void uiTouch(int x, int y) {
         else if (y >= 200 && x >= 220) { s_ui = UI_VOLMAX; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
-        if (y >= 54 && y <= 204) {                                  // three family cells
+        if (y >= 54 && y <= 204) {                                  // FAM_COUNT family cells
             for (int f = 0; f < FAM_COUNT; f++) {
-                int cx0 = 6 + f * 104;
-                if (x >= cx0 && x < cx0 + 98) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; break; }
+                int cx0 = 6 + f * UI_FAM_P;
+                if (x >= cx0 && x < cx0 + UI_FAM_W) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; break; }
             }
         }
     } else if (s_ui == UI_MODE) {
@@ -1611,7 +1647,8 @@ void audioSourceApplyInputLevel(int level) {
 }
 
 // Live stream-mode select (0=SOLID/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
-// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono, 7=TURBO/ADPCM-mono, 8=FINE/Opus-16k-mono).
+// 4=STEREO, 5=HIFI, 6=LITE/ADPCM-mono, 7=TURBO/ADPCM-mono, 8=FINE/Opus-16k-mono,
+// 9=SOLID48/Opus-48k-stereo).
 // Persisted to NVS,
 // then reboots into the mode (a clean boot per mode is proven stable; a live
 // re-init crashed the encoder). On the classic (non-CoreS3) sender only mode 0
