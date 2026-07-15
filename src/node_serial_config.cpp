@@ -134,12 +134,26 @@ static void handleLine(const char* line) {
 
         p.begin("tx", true);
         r["input_level"] = p.getInt("input_level", 50);
+        {
+            // input_mix (DEC-046 follow-up): CoreS3 line-in mono-ize workaround —
+            // see audio_source.cpp s_input_mix docstring. Read straight from NVS
+            // (like input_level above) so get_info is correct even before the
+            // AUDIO_SOURCE-only live setter has run this boot.
+            static const char* mixNames[3] = {"stereo", "mono_l", "mono_r"};
+            uint8_t mixv = p.getUChar("input_mix", 0);
+            r["input_mix"] = mixNames[mixv > 2 ? 0 : mixv];
+        }
         p.end();
 #ifdef AUDIO_SOURCE
         // LONGRANGE state (DEC-043 P5). Only the live audio source carries it.
         r["range"]      = audioSourceGetRange() ? "long" : "normal";
         r["lr_preset"]  = audioSourceGetLrPreset();
         r["lr_bitrate"] = audioSourceGetLrBitrate();
+        // input_sel (EXPERIMENTAL, set_input_sel — see audio_source.cpp
+        // s_input_sel docstring). NOT NVS-backed like input_mix above: this
+        // reads the LIVE in-RAM value (always "in1" on classic Core, where
+        // audioSourceApplyInputSel is a no-op).
+        r["input_sel"]  = audioSourceGetInputSelName();
 #endif
 
         sendResp(r);
@@ -194,6 +208,63 @@ static void handleLine(const char* line) {
         audioSourceApplyInputLevel(lv);   // live: drives ES8388 analog PGA on CoreS3
 #endif
         r["status"] = "ok"; r["cmd"] = cmd; r["level"] = lv;
+        sendResp(r);
+        return;
+    }
+
+    // ---- set_input_mix -------------------------------------------------
+    // {"cmd":"set_input_mix","mix":"stereo"|"mono_l"|"mono_r"} — CoreS3
+    // line-in mono-ize workaround for a HW-defective L channel (feeds the
+    // healthy channel to both sides). See audio_source.cpp s_input_mix
+    // docstring. Persisted; applied live, no reboot (unlike set_stream_mode).
+    if (strcmp(cmd, "set_input_mix") == 0) {
+        const char* mix = doc["mix"] | "";
+        int mixVal;
+        if (strcmp(mix, "stereo") == 0) mixVal = 0;
+        else if (strcmp(mix, "mono_l") == 0) mixVal = 1;
+        else if (strcmp(mix, "mono_r") == 0) mixVal = 2;
+        else {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "mix must be 'stereo'/'mono_l'/'mono_r'";
+            sendResp(r); return;
+        }
+        Preferences p; p.begin("tx", false); p.putUChar("input_mix", (uint8_t)mixVal); p.end();
+#ifdef AUDIO_SOURCE
+        audioSourceApplyInputMix(mixVal);   // live: no reboot, see docstring
+#endif
+        r["status"] = "ok"; r["cmd"] = cmd; r["mix"] = mix;
+        sendResp(r);
+        return;
+    }
+
+    // ---- set_input_sel — EXPERIMENTAL hardware-debug command ---------------
+    // {"cmd":"set_input_sel","sel":"in1"|"in2"|"diff1"} — hot-switches the
+    // ES8388 ADC input mux (CoreS3 only) to investigate a frequency-shelf
+    // attenuation defect on the line-in L channel. See audio_source.cpp
+    // s_input_sel docstring for the full hypothesis + the 3 values this
+    // enumerates (es_adc_input_t has exactly these 3 — no others exist).
+    // NOT persisted to NVS: applied live only, a reboot restores in1.
+    if (strcmp(cmd, "set_input_sel") == 0) {
+        const char* sel = doc["sel"] | "";
+        int selVal;
+        if (strcmp(sel, "in1") == 0) selVal = 0;        // ADC_INPUT_LINPUT1_RINPUT1
+        else if (strcmp(sel, "in2") == 0) selVal = 1;   // ADC_INPUT_LINPUT2_RINPUT2
+        else if (strcmp(sel, "diff1") == 0) selVal = 2; // ADC_INPUT_DIFFERENCE1
+        else {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "sel must be 'in1'/'in2'/'diff1'";
+            sendResp(r); return;
+        }
+#ifdef AUDIO_SOURCE
+        if (audioSourceApplyInputSel(selVal)) {
+            r["status"] = "ok"; r["cmd"] = cmd; r["sel"] = sel;
+        } else {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "not supported (classic Core has no addressable ADC input mux, or codec not ready)";
+        }
+#else
+        r["status"] = "error"; r["cmd"] = cmd; r["message"] = "not a source";
+#endif
         sendResp(r);
         return;
     }

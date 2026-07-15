@@ -306,6 +306,52 @@ static const int      I2S_MCLK = 0, I2S_BCLK = 13, I2S_LRCK = 12, I2S_DIN = 34;
 static int     s_input_level = 50;   // 0..100, 50 = unity
 static uint8_t s_channel     = 1;    // ESP-NOW channel (for display)
 
+// ---- Input mono-ize (input_mix, NVS "tx"/"input_mix") ----------------------
+// Workaround for a HARDWARE defect confirmed on this CoreS3 Module-Audio unit's
+// L line-in channel: frequency-shaped attenuation (-6 dB @100 Hz -> -15 dB
+// @1 kHz+, a shelf), measured identically across two cables with a
+// verified-symmetric source. R is frequency-flat and healthy. A flat gain trim
+// (R_TRIM_PCT, see audioRxTask) cannot correct a frequency-SHAPED asymmetry, so
+// this feeds the healthy channel to BOTH sides instead, applied in audioRxTask
+// right after the raw L/R samples are read (see its docstring there).
+//   stereo (default) — L/R as captured (with the existing R_TRIM_PCT balance).
+//   mono_l — both channels carry L (use if a future unit's R is the bad one).
+//   mono_r — both channels carry R (the fix for THIS unit's defective L).
+enum InputMix : uint8_t { INPUT_MIX_STEREO = 0, INPUT_MIX_MONO_L = 1, INPUT_MIX_MONO_R = 2 };
+static const char* INPUT_MIX_NAME[3] = { "stereo", "mono_l", "mono_r" };
+// Single writer (serial handler / loop task, via audioSourceApplyInputMix) and
+// single reader (audioRxTask, core 1) — a plain volatile uint8 enum is
+// lock-free-safe on ESP32 (matches s_mode's treatment above), no torn reads.
+static volatile uint8_t s_input_mix = INPUT_MIX_STEREO;
+
+// ---- Input-pin select (input_sel) — EXPERIMENTAL hardware-debug command ----
+// (set_input_sel; see audioSourceApplyInputSel below). Investigating a
+// systematic frequency-shelf attenuation on the module's line-in L channel,
+// confirmed IDENTICAL across two different CoreS3 units + two different
+// Module-Audio modules (R is frequency-flat and healthy on both) — this is
+// deeper than the per-unit asymmetry input_mix works around above. Leading
+// hypothesis: the module's TRS jack wires L to a DIFFERENT ES8388 ADC input
+// pin than the firmware selects (audioSourceSetup hardcodes
+// ADC_INPUT_LINPUT1_RINPUT1), so the configured L pin only picks up
+// capacitive bleed-through of the real signal. This command hot-switches the
+// ES8388 ADC input mux (M5ModuleAudio::setMicInputLine) while measuring, so
+// every candidate pin can be tried without a reflash.
+//
+// es_adc_input_t (Module-Audio lib, es8388.hpp) defines EXACTLY three values
+// — this enumerates all of them:
+//   ADC_INPUT_LINPUT1_RINPUT1 = 0x00  "in1"    (compiled-in default; both ch on pin 1)
+//   ADC_INPUT_LINPUT2_RINPUT2 = 0x10  "in2"    (both ch on pin 2 — the mic-input pins)
+//   ADC_INPUT_DIFFERENCE1     = 0xF0  "diff1"  (differential input across L1/L2 or R1/R2)
+// Deliberately NOT persisted to NVS: this is a one-off measurement aid, not a
+// device setting — a reboot always restores the compiled-in default (in1) so
+// an interrupted test session can never strand the device on an unverified
+// input. Single writer (serial handler, via audioSourceApplyInputSel) /
+// single reader (this printf + get_info) — plain volatile uint8, same
+// lock-free reasoning as s_input_mix above.
+enum InputSel : uint8_t { INPUT_SEL_IN1 = 0, INPUT_SEL_IN2 = 1, INPUT_SEL_DIFF1 = 2, INPUT_SEL_COUNT = 3 };
+static const char* INPUT_SEL_NAME[INPUT_SEL_COUNT] = { "in1", "in2", "diff1" };
+static volatile uint8_t s_input_sel = INPUT_SEL_IN1;   // NOT NVS-backed — see docstring above
+
 // ---- ADPCM encoder state (continuous across packets) ----------------------
 static AdpcmState s_sl, s_sr;
 static uint8_t    s_seq = 0;
@@ -859,6 +905,14 @@ static void audioRxTask(void* /*arg*/) {
     uint32_t dcount = 0;
     uint8_t taskMode = 0xFF;                 // detect live mode switches
     static int16_t rx[FRAMES_PKT * 2];      // read chunk (64 stereo frames)
+    // Per-channel L/R balance: the M5 Module-Audio line-in captures R ~+3.3 dB
+    // hotter than L (analog ES8388/board mismatch; measured R/L=1.47 with a
+    // balanced source). The M5 library exposes no per-channel gain and the
+    // ES8388 ADC-volume register does not attenuate it, so trim R here in
+    // software — hoisted to function scope so both the FIR-decimated path
+    // (modes 0-8, below) and the raw 48 kHz path (mode 9 / SOLID48, below)
+    // apply the IDENTICAL trim. Tune R_TRIM_PCT (100 = no trim).
+    static const int R_TRIM_PCT = 68;        // R * 0.68 ≈ -3.3 dB
     for (;;) {
         drainI2sEvents();   // tally RX overflow / DMA errors every iteration
         size_t br = 0;
@@ -869,18 +923,50 @@ static void audioRxTask(void* /*arg*/) {
             // L/R swapped vs the raw I2S slot order (receiver was reversed).
             int16_t L = rx[i + 1];
             int16_t R = rx[i];
+            // Input mono-ize (s_input_mix != stereo): feed the healthy channel to
+            // BOTH sides — see the s_input_mix docstring above for why (CoreS3
+            // L-channel HW defect, frequency-shaped, not fixable by a flat trim).
+            // Applied here, immediately after the raw L/R read and BEFORE rawStat()
+            // and the R-trim below, so every downstream consumer (heartbeat/CLIP
+            // diagnostics, the level meter, and the encoded wire) sees the SAME
+            // post-mono-ize signal in every mode.
+            if (s_input_mix == INPUT_MIX_MONO_R) L = R;
+            else if (s_input_mix == INPUT_MIX_MONO_L) R = L;
             rawStat(L, R);
             // Mode 9 (SOLID48): full 48 kHz stereo direct into Opus, bypassing the
             // FIR decimation entirely. Checked here (before firPush/dcount) since
             // the mode-switch/encoder-config block below only runs at the
             // decimated-sample rate and would never fire for a mode that skips
             // that gate on every sample — so this mode configures its own encoder
-            // once, on the first sample after boot. NOTE: the DC-blocker, R-trim,
-            // and UI level-meter live INSIDE the decimation gate below, so this
-            // mode streams raw (no DC-block/R-trim/meter) — acceptable for now.
+            // once, on the first sample after boot. R-trim (R_TRIM_PCT, declared
+            // at function scope above) IS applied here, identically to the
+            // decimation-gate path below (~line 920): same constant, same
+            // int32-multiply-then-clamp-to-int16 shape, applied before both the
+            // meter peak update and opusPushSample, so the meter and the wire see
+            // the same signal in both paths. The DC-blocker is deliberately still
+            // skipped here — its IIR coefficient (DCA) is tuned for the 16 kHz
+            // decimated domain and would need re-derivation for this raw 48 kHz
+            // stream; revisit if HP thump/DC offset is observed in this mode.
             if (s_mode == MODE_SOLID48) {
                 if (taskMode != MODE_SOLID48) { opusEncoderConfig(MODE_SOLID48); taskMode = MODE_SOLID48; }
-                opusPushSample(L, R);
+                // R-trim (R_TRIM_PCT) exists solely to balance a defective L
+                // against a healthy R. When input_mix has already mono-ized both
+                // channels to the SAME source sample (above), running the trim
+                // would recreate a 0.68x imbalance between two identical
+                // channels instead of correcting anything — bypass it.
+                int16_t Rt;
+                if (s_input_mix == INPUT_MIX_STEREO) {
+                    int32_t rTrim = (int32_t)R * R_TRIM_PCT / 100;
+                    if (rTrim > 32767) rTrim = 32767; else if (rTrim < -32768) rTrim = -32768;
+                    Rt = (int16_t)rTrim;
+                } else {
+                    Rt = R;
+                }
+                { uint16_t al = (uint16_t)(L < 0 ? -(int32_t)L : (int32_t)L);
+                  uint16_t ar = (uint16_t)(Rt < 0 ? -(int32_t)Rt : (int32_t)Rt);
+                  if (al > s_uiLpk) s_uiLpk = al;
+                  if (ar > s_uiRpk) s_uiRpk = ar; }
+                opusPushSample(L, Rt);
                 continue;
             }
             firPush(L, R);
@@ -895,14 +981,17 @@ static void audioRxTask(void* /*arg*/) {
                 const float DCA = 0.996f;
                 dcyl = (float)l - dcxl + DCA * dcyl; dcxl = (float)l; l = (int32_t)dcyl;
                 dcyr = (float)r - dcxr + DCA * dcyr; dcxr = (float)r; r = (int32_t)dcyr;
-                // Per-channel L/R balance: the M5 Module-Audio line-in captures R
-                // ~+3.3 dB hotter than L (analog ES8388/board mismatch; measured
-                // R/L=1.47 with a balanced source). The M5 library exposes no per-
-                // channel gain and the ES8388 ADC-volume register did not attenuate
-                // it, so trim R here on the DC-blocked signal. Balances both the
-                // encoded stream and the meter. Tune R_TRIM_PCT (100 = no trim).
-                static const int R_TRIM_PCT = 68;        // R * 0.68 ≈ -3.3 dB
-                r = (int32_t)r * R_TRIM_PCT / 100;
+                // Per-channel L/R balance: trim R on the DC-blocked signal using
+                // R_TRIM_PCT (declared once at function scope above, shared with
+                // the mode-9/SOLID48 raw path so both stay balanced identically).
+                // Balances both the encoded stream and the meter. Bypassed when
+                // input_mix has mono-ized both channels to the same source (see
+                // s_input_mix docstring / the identical bypass in the mode-9
+                // branch above) — the trim exists only to correct L-vs-R hardware
+                // asymmetry and would recreate that imbalance otherwise.
+                if (s_input_mix == INPUT_MIX_STEREO) {
+                    r = (int32_t)r * R_TRIM_PCT / 100;
+                }
                 if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
                 if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
                 // HOME level meter: peak of the DC-blocked, L/R-balanced AC signal.
@@ -983,6 +1072,8 @@ void audioSourceSetup() {
         p.end();
         p.begin("tx", true);
         s_input_level = p.getInt("input_level", 50);
+        s_input_mix   = p.getUChar("input_mix", INPUT_MIX_STEREO);
+        if (s_input_mix > INPUT_MIX_MONO_R) s_input_mix = INPUT_MIX_STEREO;
         s_mode        = p.getUChar("mode", MODE_ADPCM);
         if (s_mode >= MODE_COUNT) s_mode = MODE_ADPCM;
         s_range_long  = p.getBool("range_long", false);
@@ -1120,9 +1211,10 @@ void audioSourceSetup() {
 #endif
 
     Serial.printf("[AUDIO-SRC] ch=%u capture=%u Hz -> stream=%u Hz, "
-                  "input_level=%d, max_inflight=%d\n",
+                  "input_level=%d, input_mix=%s, input_sel=%s, max_inflight=%d\n",
                   s_channel, CAPTURE_RATE, STREAM_RATE,
-                  s_input_level, STREAM_MAX_INFLIGHT);
+                  s_input_level, INPUT_MIX_NAME[s_input_mix],
+                  INPUT_SEL_NAME[s_input_sel], STREAM_MAX_INFLIGHT);
 }
 
 #ifdef BOARD_CORES3
@@ -1180,13 +1272,26 @@ static inline uint8_t familyOf(uint8_t mode) {
     return (mode == MODE_ADPCM || mode == MODE_MONO8K || mode == MODE_TURBO) ? FAM_ADPCM : FAM_OPUS;
 }
 static uint8_t s_uiFamily = FAM_ADPCM;   // family the MODE grid is currently browsing
-// SELECT-TYPE (UI_FAMILY) grid geometry — generalized from the old hardcoded
-// 3-cell layout (x = 6 + f*104, w = 98) so a 4th (or Nth) family still fits the
-// ~320 px panel width: for FAM_COUNT=3 this reproduces the exact prior pixel
-// values (98 W / 104 pitch); for FAM_COUNT=4 it yields 72 W / 78 pitch.
+// SELECT-TYPE (UI_FAMILY) grid geometry — generalized rows x cols (not hardcoded
+// to a single row) so the family picker keeps fitting the ~320x240 panel as
+// families are added. A single row of N cells gets too narrow past 3 entries
+// (labels/hints clip on a 320 px panel — this is what forced the FAM_COUNT=4
+// -> 2x2 switch), so once FAM_COUNT > 3 we grow downward into a 2-column grid
+// instead of shrinking cells further. For FAM_COUNT<=3 this reproduces the old
+// single-row layout exactly (FAM_COUNT=3 -> 98 W / 104 pitch, 1 row of 150 H,
+// matching the original hardcoded values bit-for-bit).
 // Shared by render (uiRepaint) + touch hit-test (uiTouch).
-static const int UI_FAM_W = (308 - (FAM_COUNT - 1) * 6) / FAM_COUNT;   // cell width
-static const int UI_FAM_P = UI_FAM_W + 6;                               // pitch (x stride)
+static const int UI_FAM_X0   = 6;                                            // grid left edge
+static const int UI_FAM_Y0   = 54;                                           // grid top edge
+static const int UI_FAM_GW   = 308;                                          // grid width (6..314)
+static const int UI_FAM_GH   = 150;                                          // grid height (54..204)
+static const int UI_FAM_GAP  = 6;                                            // inter-cell gap
+static const int UI_FAM_COLS = (FAM_COUNT > 3) ? 2 : FAM_COUNT;              // 2 cols once >3 families
+static const int UI_FAM_ROWS = (FAM_COUNT + UI_FAM_COLS - 1) / UI_FAM_COLS;  // ceil(count/cols)
+static const int UI_FAM_W    = (UI_FAM_GW - (UI_FAM_COLS - 1) * UI_FAM_GAP) / UI_FAM_COLS;  // cell width
+static const int UI_FAM_H    = (UI_FAM_GH - (UI_FAM_ROWS - 1) * UI_FAM_GAP) / UI_FAM_ROWS;  // cell height
+static const int UI_FAM_PX   = UI_FAM_W + UI_FAM_GAP;                        // col pitch (x stride)
+static const int UI_FAM_PY   = UI_FAM_H + UI_FAM_GAP;                        // row pitch (y stride)
 
 // MODE-select 3×2 grid geometry — row-major, i = row*2 + col (e.g. the OPUS
 // family fills FAST|BALANCED / SMOOTH|FINE / STEREO|HIFI). Larger cells than the old 6-row list to stop
@@ -1291,11 +1396,14 @@ static void uiRepaint() {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
         uint8_t curFam = familyOf(m);
-        // FAM_COUNT cells (ADPCM / OPUS / LONG RANGE / HIFI+) sized by
-        // UI_FAM_W/UI_FAM_P so they always fit the panel width; the two-word
+        // FAM_COUNT cells (ADPCM / OPUS / LONG RANGE / HIFI+) laid out on a
+        // UI_FAM_COLS x UI_FAM_ROWS grid (2x2 for FAM_COUNT=4) sized by
+        // UI_FAM_W/UI_FAM_H so they always fit the panel; the two-word
         // "LONG RANGE" name wraps to 2 lines.
         for (int f = 0; f < FAM_COUNT; f++) {
-            int x = 6 + f * UI_FAM_P, y = 54, w = UI_FAM_W, h = 150;
+            int col = f % UI_FAM_COLS, row = f / UI_FAM_COLS;
+            int x = UI_FAM_X0 + col * UI_FAM_PX, y = UI_FAM_Y0 + row * UI_FAM_PY;
+            int w = UI_FAM_W, h = UI_FAM_H;
             int mx = x + w / 2, my = y + h / 2;
             bool cur = (f == curFam);
             uint16_t bg = cur ? UI_SEL_BG : TFT_BLACK;
@@ -1432,12 +1540,18 @@ static void uiTouch(int x, int y) {
         else if (y >= 200 && x >= 220) { s_ui = UI_VOLMAX; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
         if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }   // header = back to HOME
-        if (y >= 54 && y <= 204) {                                  // FAM_COUNT family cells
-            for (int f = 0; f < FAM_COUNT; f++) {
-                int cx0 = 6 + f * UI_FAM_P;
-                if (x >= cx0 && x < cx0 + UI_FAM_W) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; break; }
-            }
-        }
+        // FAM_COUNT family cells on the UI_FAM_COLS x UI_FAM_ROWS grid (2x2 for
+        // FAM_COUNT=4) — same col/row math as UI_MODE below, generalized to N cols.
+        if (x < UI_FAM_X0 || y < UI_FAM_Y0) return;
+        int col = (x - UI_FAM_X0) / UI_FAM_PX;
+        int row = (y - UI_FAM_Y0) / UI_FAM_PY;
+        if (col < 0 || col >= UI_FAM_COLS || row < 0 || row >= UI_FAM_ROWS) return;
+        // Reject taps that land in the gap band between cells (outside the cell rect).
+        int cx = x - (UI_FAM_X0 + col * UI_FAM_PX);
+        int cy = y - (UI_FAM_Y0 + row * UI_FAM_PY);
+        if (cx >= UI_FAM_W || cy >= UI_FAM_H) return;
+        int f = row * UI_FAM_COLS + col;
+        if (f < FAM_COUNT) { s_uiFamily = (uint8_t)f; s_ui = UI_MODE; s_uiDirty = true; }
     } else if (s_ui == UI_MODE) {
         if (y < 36) { s_ui = UI_FAMILY; s_uiDirty = true; return; } // header = back to family
         if (x < UI_MODE_X0) return;                                 // left of the grid
@@ -1644,6 +1758,55 @@ void audioSourceApplyInputLevel(int level) {
 #ifdef BOARD_CORES3
     if (s_codecOk) s_audio.setMicGain(pgaFromLevel(level));
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Live input-mix update (Studio set_input_mix). No reboot needed: s_input_mix
+// is a plain volatile static, single writer (this function, called from the
+// loop/serial task) / single reader (audioRxTask, core 1) — see its docstring
+// above for why that's lock-free-safe on ESP32. audioRxTask picks up the new
+// value on the very next captured sample.
+void audioSourceApplyInputMix(int mix) {
+    if (mix < INPUT_MIX_STEREO || mix > INPUT_MIX_MONO_R) return;
+    s_input_mix = (uint8_t)mix;
+    Serial.printf("[AUDIO-SRC] input_mix -> %s\n", INPUT_MIX_NAME[s_input_mix]);
+}
+
+// ---------------------------------------------------------------------------
+// Live input-pin select (Studio/serial set_input_sel, EXPERIMENTAL — see the
+// s_input_sel docstring above). CoreS3 only: the classic Core's es8388Init()
+// hardcodes LINPUT1/RINPUT1 via manual register writes and has no addressable
+// mux to hot-switch, so this is a no-op there and reports unsupported.
+// `sel` is an INPUT_SEL_* index (node_serial_config.cpp maps the JSON "sel"
+// string to it, mirroring set_input_mix's string->int convention). Returns
+// false if `sel` is out of range, the board doesn't support it, or the codec
+// never came up (s_codecOk) — the caller reports that as an error instead of
+// silently no-op'ing.
+bool audioSourceApplyInputSel(int sel) {
+#ifdef BOARD_CORES3
+    if (sel < INPUT_SEL_IN1 || sel >= INPUT_SEL_COUNT) return false;
+    if (!s_codecOk) return false;
+    static const es_adc_input_t ADC_SEL[INPUT_SEL_COUNT] = {
+        ADC_INPUT_LINPUT1_RINPUT1,   // in1   — compiled-in default
+        ADC_INPUT_LINPUT2_RINPUT2,   // in2
+        ADC_INPUT_DIFFERENCE1,       // diff1
+    };
+    s_audio.setMicInputLine(ADC_SEL[sel]);
+    s_input_sel = (uint8_t)sel;
+    Serial.printf("[AUDIO-SRC] input_sel -> %s (EXPERIMENTAL, not persisted)\n",
+                  INPUT_SEL_NAME[s_input_sel]);
+    return true;
+#else
+    (void)sel;
+    return false;   // classic Core: no addressable ADC input mux
+#endif
+}
+
+// Current input_sel as a friendly name, for get_info / boot log. Valid on
+// every board (the underlying value is just the compiled default on classic,
+// where audioSourceApplyInputSel always fails).
+const char* audioSourceGetInputSelName() {
+    return INPUT_SEL_NAME[s_input_sel];
 }
 
 // Live stream-mode select (0=SOLID/ADPCM, 1=FAST, 2=BALANCED, 3=SMOOTH,
