@@ -307,16 +307,16 @@ static int     s_input_level = 50;   // 0..100, 50 = unity
 static uint8_t s_channel     = 1;    // ESP-NOW channel (for display)
 
 // ---- Input mono-ize (input_mix, NVS "tx"/"input_mix") ----------------------
-// Workaround for a HARDWARE defect confirmed on this CoreS3 Module-Audio unit's
-// L line-in channel: frequency-shaped attenuation (-6 dB @100 Hz -> -15 dB
-// @1 kHz+, a shelf), measured identically across two cables with a
-// verified-symmetric source. R is frequency-flat and healthy. A flat gain trim
-// (R_TRIM_PCT, see audioRxTask) cannot correct a frequency-SHAPED asymmetry, so
-// this feeds the healthy channel to BOTH sides instead, applied in audioRxTask
-// right after the raw L/R samples are read (see its docstring there).
-//   stereo (default) — L/R as captured (with the existing R_TRIM_PCT balance).
+// Workaround for a HARDWARE defect in the M5 Module-Audio: the L line-in channel
+// has frequency-shaped attenuation (R/L ~1.5x @100 Hz -> 4-6x @1 kHz+), caused by
+// module cap C9 shunting LIN1 to the mic-bias net (confirmed on 2 units + M5
+// community topic 7966). R is frequency-flat and healthy. The proper fix is to
+// remove C9 in hardware (restores true stereo — the standard going forward); for
+// un-modified inventory, mono_r feeds the healthy R to BOTH sides. Applied in
+// audioRxTask right after the raw L/R read (see its docstring there).
+//   stereo (default) — L/R streamed exactly as captured (no trim).
 //   mono_l — both channels carry L (use if a future unit's R is the bad one).
-//   mono_r — both channels carry R (the fix for THIS unit's defective L).
+//   mono_r — both channels carry R (workaround for an un-modified unit's bad L).
 enum InputMix : uint8_t { INPUT_MIX_STEREO = 0, INPUT_MIX_MONO_L = 1, INPUT_MIX_MONO_R = 2 };
 static const char* INPUT_MIX_NAME[3] = { "stereo", "mono_l", "mono_r" };
 // Single writer (serial handler / loop task, via audioSourceApplyInputMix) and
@@ -382,7 +382,7 @@ static          bool     s_codecOk = true;   // CoreS3: ES8388/STM32 begin() res
 // Written per captured sample in rawStat (any capture path); read + reset in
 // uiUpdateHome so the meter reflects the last ~0.4 s. volatile: rawStat runs in
 // the CoreS3 capture task (core 1) while uiUpdateHome runs in the Arduino loop.
-static volatile uint16_t s_uiLpk = 0, s_uiRpk = 0;      // trimmed AC peak (bar level)
+static volatile uint16_t s_uiLpk = 0, s_uiRpk = 0;      // DC-blocked AC peak (bar level)
 static volatile uint16_t s_rawLpk = 0, s_rawRpk = 0;    // RAW ADC peak (clip detect)
 
 // ---- piggyback state (saved from the last successfully enqueued packet) ----
@@ -478,16 +478,16 @@ static inline void rawStat(int16_t l, int16_t r) {
     if (r > s_rmax) s_rmax = r;
     s_rsum += r;
     s_scnt++;
-    // Meter CLIP detection reads the RAW ADC peak here (pre-trim): the ADC
-    // saturates on the raw sample, so clipping must be judged BEFORE the L/R
-    // balance trim (which scales R down and would otherwise hide R's clipping —
-    // R can clip the ADC while its trimmed bar still reads ~45%).
+    // Meter CLIP detection reads the RAW ADC peak here (pre-DC-block): the ADC
+    // saturates on the raw sample (incl. any DC offset), so clipping must be
+    // judged on the raw peak — a channel can clip the ADC while its DC-blocked
+    // bar (s_uiLpk/s_uiRpk) reads lower.
     uint16_t al = (uint16_t)(l < 0 ? -(int32_t)l : (int32_t)l);
     uint16_t ar = (uint16_t)(r < 0 ? -(int32_t)r : (int32_t)r);
     if (al > s_rawLpk) s_rawLpk = al;
     if (ar > s_rawRpk) s_rawRpk = ar;
-    // The level BARS read the DC-blocked, L/R-balanced signal in audioRxTask
-    // (s_uiLpk/s_uiRpk) — the raw DC offset would mislead the bar level.
+    // The level BARS read the DC-blocked signal in audioRxTask (s_uiLpk/s_uiRpk)
+    // — the raw DC offset would mislead the bar level.
 }
 
 // Periodic serial heartbeat (~2 s) for headless verification.
@@ -905,14 +905,13 @@ static void audioRxTask(void* /*arg*/) {
     uint32_t dcount = 0;
     uint8_t taskMode = 0xFF;                 // detect live mode switches
     static int16_t rx[FRAMES_PKT * 2];      // read chunk (64 stereo frames)
-    // Per-channel L/R balance: the M5 Module-Audio line-in captures R ~+3.3 dB
-    // hotter than L (analog ES8388/board mismatch; measured R/L=1.47 with a
-    // balanced source). The M5 library exposes no per-channel gain and the
-    // ES8388 ADC-volume register does not attenuate it, so trim R here in
-    // software — hoisted to function scope so both the FIR-decimated path
-    // (modes 0-8, below) and the raw 48 kHz path (mode 9 / SOLID48, below)
-    // apply the IDENTICAL trim. Tune R_TRIM_PCT (100 = no trim).
-    static const int R_TRIM_PCT = 68;        // R * 0.68 ≈ -3.3 dB
+    // L/R balance history: the M5 Module-Audio's LEFT line-in is attenuated with a
+    // frequency-SHAPED response (R/L ~1.5x @100 Hz -> 4-6x @1 kHz+), caused by
+    // module cap C9 shunting LIN1 to the mic-bias net. An earlier flat R-trim
+    // (R*0.68, commit 5d6be08) only balanced the broadband average and could never
+    // correct the frequency shape, so it was REMOVED: the defect is fixed in
+    // hardware by removing C9 (true stereo — the standard) or worked around with
+    // input_mix=mono_r for un-modified units. L/R are streamed exactly as captured.
     for (;;) {
         drainI2sEvents();   // tally RX overflow / DMA errors every iteration
         size_t br = 0;
@@ -926,10 +925,9 @@ static void audioRxTask(void* /*arg*/) {
             // Input mono-ize (s_input_mix != stereo): feed the healthy channel to
             // BOTH sides — see the s_input_mix docstring above for why (CoreS3
             // L-channel HW defect, frequency-shaped, not fixable by a flat trim).
-            // Applied here, immediately after the raw L/R read and BEFORE rawStat()
-            // and the R-trim below, so every downstream consumer (heartbeat/CLIP
-            // diagnostics, the level meter, and the encoded wire) sees the SAME
-            // post-mono-ize signal in every mode.
+            // Applied here, immediately after the raw L/R read and BEFORE rawStat(),
+            // so every downstream consumer (heartbeat/CLIP diagnostics, the level
+            // meter, and the encoded wire) sees the SAME signal in every mode.
             if (s_input_mix == INPUT_MIX_MONO_R) L = R;
             else if (s_input_mix == INPUT_MIX_MONO_L) R = L;
             rawStat(L, R);
@@ -938,35 +936,18 @@ static void audioRxTask(void* /*arg*/) {
             // the mode-switch/encoder-config block below only runs at the
             // decimated-sample rate and would never fire for a mode that skips
             // that gate on every sample — so this mode configures its own encoder
-            // once, on the first sample after boot. R-trim (R_TRIM_PCT, declared
-            // at function scope above) IS applied here, identically to the
-            // decimation-gate path below (~line 920): same constant, same
-            // int32-multiply-then-clamp-to-int16 shape, applied before both the
-            // meter peak update and opusPushSample, so the meter and the wire see
-            // the same signal in both paths. The DC-blocker is deliberately still
-            // skipped here — its IIR coefficient (DCA) is tuned for the 16 kHz
-            // decimated domain and would need re-derivation for this raw 48 kHz
-            // stream; revisit if HP thump/DC offset is observed in this mode.
+            // once, on the first sample after boot. L/R are pushed as captured
+            // (R-trim removed — see the function-scope note above). The DC-blocker
+            // is deliberately still skipped here — its IIR coefficient (DCA) is
+            // tuned for the 16 kHz decimated domain and would need re-derivation
+            // for this raw 48 kHz stream; revisit if HP thump/DC offset is seen.
             if (s_mode == MODE_SOLID48) {
                 if (taskMode != MODE_SOLID48) { opusEncoderConfig(MODE_SOLID48); taskMode = MODE_SOLID48; }
-                // R-trim (R_TRIM_PCT) exists solely to balance a defective L
-                // against a healthy R. When input_mix has already mono-ized both
-                // channels to the SAME source sample (above), running the trim
-                // would recreate a 0.68x imbalance between two identical
-                // channels instead of correcting anything — bypass it.
-                int16_t Rt;
-                if (s_input_mix == INPUT_MIX_STEREO) {
-                    int32_t rTrim = (int32_t)R * R_TRIM_PCT / 100;
-                    if (rTrim > 32767) rTrim = 32767; else if (rTrim < -32768) rTrim = -32768;
-                    Rt = (int16_t)rTrim;
-                } else {
-                    Rt = R;
-                }
                 { uint16_t al = (uint16_t)(L < 0 ? -(int32_t)L : (int32_t)L);
-                  uint16_t ar = (uint16_t)(Rt < 0 ? -(int32_t)Rt : (int32_t)Rt);
+                  uint16_t ar = (uint16_t)(R < 0 ? -(int32_t)R : (int32_t)R);
                   if (al > s_uiLpk) s_uiLpk = al;
                   if (ar > s_uiRpk) s_uiRpk = ar; }
-                opusPushSample(L, Rt);
+                opusPushSample(L, R);
                 continue;
             }
             firPush(L, R);
@@ -981,20 +962,12 @@ static void audioRxTask(void* /*arg*/) {
                 const float DCA = 0.996f;
                 dcyl = (float)l - dcxl + DCA * dcyl; dcxl = (float)l; l = (int32_t)dcyl;
                 dcyr = (float)r - dcxr + DCA * dcyr; dcxr = (float)r; r = (int32_t)dcyr;
-                // Per-channel L/R balance: trim R on the DC-blocked signal using
-                // R_TRIM_PCT (declared once at function scope above, shared with
-                // the mode-9/SOLID48 raw path so both stay balanced identically).
-                // Balances both the encoded stream and the meter. Bypassed when
-                // input_mix has mono-ized both channels to the same source (see
-                // s_input_mix docstring / the identical bypass in the mode-9
-                // branch above) — the trim exists only to correct L-vs-R hardware
-                // asymmetry and would recreate that imbalance otherwise.
-                if (s_input_mix == INPUT_MIX_STEREO) {
-                    r = (int32_t)r * R_TRIM_PCT / 100;
-                }
+                // L/R sent as captured (R-trim removed — see the function-scope
+                // note above; the module L-channel HW defect is handled by C9
+                // removal or input_mix=mono_r, not by a flat trim).
                 if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
                 if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-                // HOME level meter: peak of the DC-blocked, L/R-balanced AC signal.
+                // HOME level meter: peak of the DC-blocked AC signal.
                 { uint16_t al = (uint16_t)(l < 0 ? -l : l);
                   uint16_t ar = (uint16_t)(r < 0 ? -r : r);
                   if (al > s_uiLpk) s_uiLpk = al;
@@ -1188,11 +1161,11 @@ void audioSourceSetup() {
         Wire.beginTransmission(0x10);   // ES8388 I2C address
         Wire.write(0x12); Wire.write(0x00);   // ADCCONTROL10: ALCSEL=00 (ALC off)
         Wire.endTransmission();
-        // NOTE: the L/R balance trim is applied DIGITALLY in audioRxTask (R_TRIM_PCT),
-        // not via an ES8388 register. The ADC digital-volume register (ADCCONTROL9 =
-        // 0x11) was measured to NOT attenuate the R capture (write took, ratio
-        // unchanged), so a firmware-domain trim on the DC-blocked signal is used
-        // instead — reliable, and it also balances the on-screen level meter.
+        // NOTE: no per-channel L/R balance trim is applied (the earlier R_TRIM_PCT
+        // was removed). The ES8388 ADC digital-volume register (ADCCONTROL9 = 0x11)
+        // was measured to NOT attenuate a channel anyway (write took, ratio
+        // unchanged). The L-channel HW defect is addressed by removing module cap
+        // C9 (true stereo) or input_mix=mono_r for un-modified units.
         Serial.printf("[AUDIO-SRC] ES8388 ready (CoreS3, switch A), PGA idx=%d, ALC off (0x12=0)\n",
                       (int)pgaFromLevel(s_input_level));
     }
@@ -1330,8 +1303,8 @@ static void uiMeterRow(int barY, int txtY, char tag, uint16_t peak, uint16_t raw
     uint16_t col = (pct >= 95) ? TFT_RED : (pct >= 70) ? TFT_YELLOW : TFT_GREEN;
     d.fillRect(MTR_X + 1, barY + 1, MTR_W - 2, MTR_H - 2, TFT_BLACK);
     if (fill > 0) d.fillRect(MTR_X + 1, barY + 1, fill, MTR_H - 2, col);
-    // CLIP judged on the RAW ADC (pre-trim) — the true saturation point. R can
-    // hit the ADC rail while its trimmed bar reads well under 100%.
+    // CLIP judged on the RAW ADC (pre-DC-block) — the true saturation point. A
+    // channel can hit the ADC rail while its DC-blocked bar reads under 100%.
     bool clip = (rawPeak >= 32000);
     char rd[16];
     if (clip) snprintf(rd, sizeof(rd), "%c CLIP ", tag);
