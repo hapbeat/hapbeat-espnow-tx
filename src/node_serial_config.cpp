@@ -143,6 +143,13 @@ static void handleLine(const char* line) {
             uint8_t mixv = p.getUChar("input_mix", 0);
             r["input_mix"] = mixNames[mixv > 2 ? 0 : mixv];
         }
+        // opus_complexity (DEC-046 follow-up, set_opus_complexity): GLOBAL
+        // Opus encoder complexity override (mode 9 SOLID48 tuning) — see
+        // audio_source.cpp s_opus_complexity_override docstring. -1 = unset
+        // (each mode's MODE_DEFS complexity applies). Read straight from NVS
+        // (like input_level/input_mix above) so get_info is correct even
+        // before the AUDIO_SOURCE-only live setter has run this boot.
+        r["opus_complexity"] = p.getInt("opus_cplx", -1);
         p.end();
 #ifdef AUDIO_SOURCE
         // LONGRANGE state (DEC-043 P5). Only the live audio source carries it.
@@ -154,6 +161,12 @@ static void handleLine(const char* line) {
         // reads the LIVE in-RAM value (always "in1" on classic Core, where
         // audioSourceApplyInputSel is a no-op).
         r["input_sel"]  = audioSourceGetInputSelName();
+        // stream_hp_buffer_ms (DEC-046 follow-up, set_stream_hp_buffer):
+        // mode-9 SOLID48 receiver HP jitter-buffer depth, broadcast as 0xAC
+        // fleet param 6 — see audioSourceSetStreamHpBuffer's docstring in
+        // audio_source.cpp. AUDIO_SOURCE-only (uses the fleet-tune mechanism,
+        // which is private to audio_source.cpp), unlike opus_complexity above.
+        r["stream_hp_buffer_ms"] = audioSourceGetStreamHpBuffer();
 #endif
 
         sendResp(r);
@@ -233,6 +246,31 @@ static void handleLine(const char* line) {
         audioSourceApplyInputMix(mixVal);   // live: no reboot, see docstring
 #endif
         r["status"] = "ok"; r["cmd"] = cmd; r["mix"] = mix;
+        sendResp(r);
+        return;
+    }
+
+    // ---- set_opus_complexity -----------------------------------------------
+    // {"cmd":"set_opus_complexity","value":0..10} — GLOBAL override of the
+    // Opus encoder complexity (OPUS_SET_COMPLEXITY) for whichever Opus mode
+    // is currently streaming (mode 9 SOLID48 in particular — DEC-046
+    // follow-up). Unset (never called this boot) falls back to each mode's
+    // MODE_DEFS complexity. Persisted; applied live to the running encoder,
+    // no reboot needed (mirrors set_input_level / set_input_mix's NVS +
+    // live-apply + get_info shape above).
+    if (strcmp(cmd, "set_opus_complexity") == 0) {
+        int cplx = doc["value"] | -1;
+        // -1 = "auto" (fall back to each mode's MODE_DEFS complexity); 0..10 = override.
+        if (cplx < -1 || cplx > 10) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "value must be -1 (auto) or 0..10";
+            sendResp(r); return;
+        }
+        Preferences p; p.begin("tx", false); p.putInt("opus_cplx", cplx); p.end();
+#ifdef AUDIO_SOURCE
+        audioSourceApplyOpusComplexity(cplx);   // live: re-ctl's the running encoder
+#endif
+        r["status"] = "ok"; r["cmd"] = cmd; r["opus_complexity"] = cplx;
         sendResp(r);
         return;
     }
@@ -318,14 +356,40 @@ static void handleLine(const char* line) {
         audioSourceSetLrBitrate(br);
         return;
     }
-    // set_fleet_param {"param":1-5,"value":0-255} → broadcast a 0xAC beacon
-    // (5 = receiver volume_max %, §3.5).
+    // set_fleet_param {"param":1-6,"value":0-255} → broadcast a 0xAC beacon
+    // (5 = receiver volume_max %, 6 = mode-9 SOLID48 HP buffer deci-ms, §3.5).
     // 1=buffer_ms 2=selection 3=lock_timeout(×10ms) 4=resync_gap (§3.5).
     if (strcmp(cmd, "set_fleet_param") == 0) {
         int param = doc["param"] | 0;
         int value = doc["value"] | 0;
+        // param 6 (mode-9 HP buffer) has a dedicated command (set_stream_hp_buffer)
+        // that keeps the NVS + get_info stream_hp_buffer_ms in sync; the raw path
+        // would broadcast a deci-ms value without updating them, so reject it here.
+        if (param == 6) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "use set_stream_hp_buffer for param 6";
+            sendResp(r); return;
+        }
         audioSourceSetFleetParam(param, value);
         r["status"] = "ok"; r["cmd"] = cmd; r["param"] = param; r["value"] = value;
+        sendResp(r);
+        return;
+    }
+    // set_stream_hp_buffer {"value":40..500} → mode-9 SOLID48 receiver HP
+    // jitter-buffer depth in ms (DEC-046 follow-up). Persists the raw ms +
+    // broadcasts it to the fleet as 0xAC param 6 (wire = clamp(ms/10,4,50)
+    // deci-ms), reusing the exact same burst ×3 + 5 s resend + epoch
+    // mechanism params 1-5 use (audioSourceSetFleetParam).
+    if (strcmp(cmd, "set_stream_hp_buffer") == 0) {
+        int ms = doc["value"] | 120;
+        if (ms < 40 || ms > 500) {
+            r["status"] = "error"; r["cmd"] = cmd;
+            r["message"] = "value must be 40..500";
+            sendResp(r); return;
+        }
+        audioSourceSetStreamHpBuffer(ms);
+        r["status"] = "ok"; r["cmd"] = cmd;
+        r["stream_hp_buffer_ms"] = audioSourceGetStreamHpBuffer();
         sendResp(r);
         return;
     }

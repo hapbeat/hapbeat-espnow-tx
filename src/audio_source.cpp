@@ -192,15 +192,17 @@ static uint8_t s_lr_preset = LR_PRESET_DEFAULT;   // NVS tx/lr_preset
 // Operator-set runtime overrides broadcast to every receiver. Set via serial
 // (loopTask); the beacon is sent from audioSourceLoop (also loopTask), burst ×3
 // on change then resent every 5 s so late-booting receivers catch up.
-static uint8_t s_fleet_val[6] = {0, 0, 0, 0, 0, 0};             // index = param_id (1-5)
-static bool    s_fleet_set[6] = {false, false, false, false, false, false};
+// index = param_id (1-6; index 0 unused). Param 6 = mode-9 SOLID48 HP
+// jitter-buffer deci-ms (DEC-046 follow-up) — see audioSourceSetStreamHpBuffer.
+static uint8_t s_fleet_val[7] = {0, 0, 0, 0, 0, 0, 0};
+static bool    s_fleet_set[7] = {false, false, false, false, false, false, false};
 static bool    s_fleet_dirty  = false;
 // Per-param epoch (P1.1, §3.5 epoch sync). Bumped on every LOCAL change (operator
 // touch/serial) so peer transmitters can tell a newer local value from a stale
 // echo. Persisted to NVS alongside the value+set-mask (P1.4) so a reboot resumes
 // broadcasting the same value at the same epoch — a peer's beacon that only saw
 // the pre-reboot epoch must not look "newer" and wrongly overwrite us back.
-static uint8_t s_fleet_epoch[6] = {0, 0, 0, 0, 0, 0};
+static uint8_t s_fleet_epoch[7] = {0, 0, 0, 0, 0, 0, 0};
 // This transmitter's own MAC (populated in audioSourceSetup via WiFi.macAddress).
 // Used only for the same-epoch/different-value tie-break in audioOnRecvCb (P1.2).
 static uint8_t s_self_mac[6] = {0, 0, 0, 0, 0, 0};
@@ -255,7 +257,7 @@ static void audioOnRecvCb(const uint8_t* mac, const uint8_t* data, int len) {
     if (len < 5 || data[0] != 0xAC) return;      // need the epoch byte to compare
     if (data[1] & 0x80) return;                  // RELAYED → not origin-to-origin
     uint8_t param = data[2];
-    if (param < 1 || param > 5) return;
+    if (param < 1 || param > 6) return;
     uint8_t value = data[3];
     uint8_t epoch = data[4];
     if (s_fleet_set[param]) {
@@ -305,6 +307,22 @@ static const int      I2S_MCLK = 0, I2S_BCLK = 13, I2S_LRCK = 12, I2S_DIN = 34;
 // ---- runtime config (NVS) -------------------------------------------------
 static int     s_input_level = 50;   // 0..100, 50 = unity
 static uint8_t s_channel     = 1;    // ESP-NOW channel (for display)
+
+// ---- Opus complexity override (opus_complexity, NVS "tx"/"opus_cplx") -----
+// GLOBAL override of OPUS_SET_COMPLEXITY, applied to whichever Opus mode is
+// currently streaming. -1 = unset (each mode's MODE_DEFS[mode].complexity
+// applies, the compiled-in default — see MODE_DEFS above). 0..10 = operator
+// override (set_opus_complexity), re-ctl'd on the live encoder immediately —
+// see audioSourceApplyOpusComplexity below. Single writer (serial handler /
+// loop task) / single reader (opusEncoderConfig + the Apply function itself),
+// same lock-free reasoning as s_input_mix above.
+static volatile int s_opus_complexity_override = -1;
+
+// ---- HP jitter-buffer depth (stream_hp_buffer_ms, NVS "tx"/"hp_buf_ms") ---
+// Raw ms (40..500) for get_info / the mode-9 SOLID48 receiver ring. The 0xAC
+// fleet-tune param-6 wire carries clamp(ms/10, 4, 50) deci-ms (a uint8 can't
+// hold a full ms range) — see audioSourceSetStreamHpBuffer below.
+static int s_hp_buffer_ms = 120;
 
 // ---- Input mono-ize (input_mix, NVS "tx"/"input_mix") ----------------------
 // Workaround for a HARDWARE defect in the M5 Module-Audio: the L line-in channel
@@ -712,16 +730,29 @@ static void opusEncoderConfig(uint8_t mode) {
         uint32_t br = (s_range_long && mode == LR_MODE) ? LR_PRESET[s_lr_preset].bitrate
                                                         : MODE_DEFS[mode].bitrate;
         opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(br));
-        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(MODE_DEFS[mode].complexity));
+        // opus_complexity override (DEC-046 follow-up, set_opus_complexity):
+        // -1 (unset) falls back to this mode's MODE_DEFS complexity; a live
+        // change after this point re-ctl's s_enc directly — see
+        // audioSourceApplyOpusComplexity.
+        uint8_t cplx = (s_opus_complexity_override >= 0)
+                           ? (uint8_t)s_opus_complexity_override
+                           : MODE_DEFS[mode].complexity;
+        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(cplx));
         opus_encoder_ctl(s_enc, OPUS_SET_VBR(0));
     }
     s_enc_mode   = mode;   // switches opusPushSample's frame size / channels
     s_opusAccumN = 0;      // drop the partial frame from the old size
     s_opHistN    = 0;      // old-size piggyback frames are invalid now
     s_decim2     = 0;
-    Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz %s, %u smp/ch, %u bps)\n",
-                  MODE_NAME[mode], rate, ch == 2 ? "stereo" : "mono",
-                  MODE_DEFS[mode].opus_frame, MODE_DEFS[mode].bitrate);
+    {
+        uint8_t cplx = (s_opus_complexity_override >= 0)
+                           ? (uint8_t)s_opus_complexity_override
+                           : MODE_DEFS[mode].complexity;
+        Serial.printf("[AUDIO-SRC] opus enc mode=%s (%u Hz %s, %u smp/ch, %u bps, cplx=%u%s)\n",
+                      MODE_NAME[mode], rate, ch == 2 ? "stereo" : "mono",
+                      MODE_DEFS[mode].opus_frame, MODE_DEFS[mode].bitrate, cplx,
+                      s_opus_complexity_override >= 0 ? " override" : "");
+    }
 }
 
 // Assemble + broadcast one Opus 0xAA packet (mode 1-3) with piggyback.
@@ -1052,12 +1083,26 @@ void audioSourceSetup() {
         s_range_long  = p.getBool("range_long", false);
         s_lr_preset   = p.getUChar("lr_preset", LR_PRESET_DEFAULT);
         if (s_lr_preset >= LR_PRESET_COUNT) s_lr_preset = LR_PRESET_DEFAULT;
+        // opus_cplx (DEC-046 follow-up, set_opus_complexity): GLOBAL Opus
+        // complexity override, -1 = unset (sentinel; MODE_DEFS complexity
+        // applies). NVS write happens in node_serial_config.cpp (mirrors
+        // input_level/input_mix above), so just restore + range-clamp here.
+        s_opus_complexity_override = p.getInt("opus_cplx", -1);
+        if (s_opus_complexity_override < -1 || s_opus_complexity_override > 10)
+            s_opus_complexity_override = -1;
+        // hp_buf_ms (DEC-046 follow-up, set_stream_hp_buffer): raw ms for
+        // get_info; the 0xAC param-6 wire value is derived from this at send
+        // time (see audioSourceSetStreamHpBuffer) and restored separately
+        // below via the generic fleet-param loop (fp6/fe6, param id 6).
+        s_hp_buffer_ms = p.getInt("hp_buf_ms", 120);
+        if (s_hp_buffer_ms < 40) s_hp_buffer_ms = 40;
+        if (s_hp_buffer_ms > 500) s_hp_buffer_ms = 500;
         // Restore fleet-tune params (P1.4): a reboot must resume broadcasting the
         // same value at the same epoch, or a peer TX that only saw the pre-reboot
         // epoch would see us as "still at the old value" and could win a stale
         // tie-break against a legitimate newer local change made just before boot.
         uint8_t fp_set = p.getUChar("fp_set", 0);
-        for (uint8_t pid = 1; pid <= 5; pid++) {
+        for (uint8_t pid = 1; pid <= 6; pid++) {
             if (!(fp_set & (1 << (pid - 1)))) continue;
             char kv[8], ke[8];
             snprintf(kv, sizeof(kv), "fp%u", pid);
@@ -1184,10 +1229,12 @@ void audioSourceSetup() {
 #endif
 
     Serial.printf("[AUDIO-SRC] ch=%u capture=%u Hz -> stream=%u Hz, "
-                  "input_level=%d, input_mix=%s, input_sel=%s, max_inflight=%d\n",
+                  "input_level=%d, input_mix=%s, input_sel=%s, max_inflight=%d, "
+                  "opus_complexity=%d, hp_buffer=%dms\n",
                   s_channel, CAPTURE_RATE, STREAM_RATE,
                   s_input_level, INPUT_MIX_NAME[s_input_mix],
-                  INPUT_SEL_NAME[s_input_sel], STREAM_MAX_INFLIGHT);
+                  INPUT_SEL_NAME[s_input_sel], STREAM_MAX_INFLIGHT,
+                  s_opus_complexity_override, s_hp_buffer_ms);
 }
 
 #ifdef BOARD_CORES3
@@ -1594,7 +1641,7 @@ static void fleetTick() {
     uint8_t pending = s_fleet_persist_pending;
     if (pending) {
         s_fleet_persist_pending &= (uint8_t)~pending;
-        for (uint8_t pid = 1; pid <= 5; pid++) {
+        for (uint8_t pid = 1; pid <= 6; pid++) {
             if (!(pending & (1 << (pid - 1)))) continue;
             persistFleetParam(pid);
             Serial.printf("[AUDIO-SRC] fleet param %u adopted from peer TX (val=%u epoch=%u)\n",
@@ -1608,18 +1655,20 @@ static void fleetTick() {
     s_fleet_dirty = false;
     s_last = now;
     for (int r = 0; r < (burst ? 3 : 1); r++)
-        for (uint8_t pid = 1; pid <= 5; pid++)
+        for (uint8_t pid = 1; pid <= 6; pid++)
             if (s_fleet_set[pid]) sendFleetBeacon(pid, s_fleet_val[pid], s_fleet_epoch[pid]);
 }
 
 // Public (serial set_fleet_param / RX VOL touch): 1=buffer_ms 2=selection
-// 3=lock_timeout(×10ms) 4=resync_gap 5=volume_max(%). Stores the value, bumps
+// 3=lock_timeout(×10ms) 4=resync_gap 5=volume_max(%) 6=mode-9 SOLID48 HP
+// jitter-buffer deci-ms (DEC-046 follow-up; set via audioSourceSetStreamHpBuffer,
+// not called directly with param=6 by callers). Stores the value, bumps
 // this param's LOCAL epoch (P1.1 — every operator-initiated change is a new
 // epoch, whether or not the value differs from what's already broadcasting, so
 // a peer TX always converges to the freshest operator intent), persists both
 // (P1.4 — reboot-safe), and triggers a ×3 burst; then resent every 5 s.
 void audioSourceSetFleetParam(int param, int value) {
-    if (param < 1 || param > 5 || value < 0 || value > 255) return;
+    if (param < 1 || param > 6 || value < 0 || value > 255) return;
     s_fleet_val[param]   = (uint8_t)value;
     s_fleet_epoch[param] = (uint8_t)(s_fleet_epoch[param] + 1);   // wraps by design (wrap-safe compare)
     s_fleet_set[param]   = true;
@@ -1674,6 +1723,31 @@ void audioSourceSetLrBitrate(int bitrate) {
 bool        audioSourceGetRange()     { return s_range_long; }
 int         audioSourceGetLrBitrate() { return LR_PRESET[s_lr_preset].bitrate; }
 const char* audioSourceGetLrPreset()  { return LR_PRESET[s_lr_preset].name; }
+
+// ---------------------------------------------------------------------------
+// Public (serial set_stream_hp_buffer): mode-9 SOLID48 receiver HP jitter-
+// buffer depth, in ms (DEC-046 follow-up). Persists the raw ms directly to
+// NVS ("tx"/"hp_buf_ms" — distinct from persistFleetParam's own fp6/fe6
+// value+epoch keys, since get_info wants the full-resolution ms, not the
+// deci-ms wire value) then broadcasts it to the fleet as 0xAC param 6 via
+// audioSourceSetFleetParam — the EXACT SAME burst ×3 + 5 s resend + per-param
+// epoch mechanism params 1-5 use. Self-contained like set_range_mode /
+// set_lr_preset above (NVS + broadcast owned here), unlike set_input_level /
+// set_input_mix (NVS owned by the node_serial_config.cpp caller) — this needs
+// the fleet machinery, which is private to this file.
+void audioSourceSetStreamHpBuffer(int ms) {
+    if (ms < 40) ms = 40;
+    if (ms > 500) ms = 500;
+    s_hp_buffer_ms = ms;
+    Preferences p; p.begin("tx", false); p.putInt("hp_buf_ms", ms); p.end();
+    int deci = ms / 10;
+    if (deci < 4) deci = 4;
+    if (deci > 50) deci = 50;
+    Serial.printf("[AUDIO-SRC] stream_hp_buffer -> %d ms (wire param6=%d deci-ms)\n", ms, deci);
+    audioSourceSetFleetParam(6, deci);   // 0xAC burst ×3 + 5 s resend, own epoch
+}
+
+int audioSourceGetStreamHpBuffer() { return s_hp_buffer_ms; }
 
 void audioSourceLoop() {
     heartbeatTick();
@@ -1744,6 +1818,35 @@ void audioSourceApplyInputMix(int mix) {
     s_input_mix = (uint8_t)mix;
     Serial.printf("[AUDIO-SRC] input_mix -> %s\n", INPUT_MIX_NAME[s_input_mix]);
 }
+
+// ---------------------------------------------------------------------------
+// Live Opus encoder complexity override (Studio set_opus_complexity, mode 9
+// SOLID48 tuning — DEC-046 follow-up). GLOBAL: applies to whichever Opus mode
+// is currently streaming (all Opus modes share this one override).
+// opusEncoderConfig only ctl's OPUS_SET_COMPLEXITY once, at encoder creation
+// (mode changes always reboot — see its docstring), so a live change here
+// re-issues OPUS_SET_COMPLEXITY directly on the running encoder; Opus
+// supports changing complexity mid-stream (a per-frame CPU/quality tradeoff
+// knob, not part of the bitstream state, so no reboot/re-init needed). -1
+// clears the override (falls back to MODE_DEFS[mode].complexity). No-op
+// (logged) on classic (non-CoreS3) senders, which have no Opus encoder. NVS
+// persistence ("tx"/"opus_cplx") is the node_serial_config.cpp caller's job,
+// mirroring set_input_level / set_input_mix above.
+void audioSourceApplyOpusComplexity(int value) {
+    if (value < -1 || value > 10) return;
+    s_opus_complexity_override = value;
+#ifdef BOARD_CORES3
+    if (s_enc && s_enc_mode >= MODE_L) {
+        uint8_t cplx = (value >= 0) ? (uint8_t)value : MODE_DEFS[s_enc_mode].complexity;
+        opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(cplx));
+        Serial.printf("[AUDIO-SRC] opus_complexity -> %d (live, encoder cplx=%u)\n", value, cplx);
+        return;
+    }
+#endif
+    Serial.printf("[AUDIO-SRC] opus_complexity -> %d (no live Opus encoder yet; applies once one starts)\n", value);
+}
+
+int audioSourceGetOpusComplexity() { return s_opus_complexity_override; }
 
 // ---------------------------------------------------------------------------
 // Live input-pin select (Studio/serial set_input_sel, EXPERIMENTAL — see the

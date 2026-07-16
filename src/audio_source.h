@@ -26,6 +26,17 @@ void audioSourceApplyInputLevel(int level);
 // No reboot needed: audioRxTask picks it up on the next captured sample.
 void audioSourceApplyInputMix(int mix);
 
+// Live Opus encoder complexity override (Studio's set_opus_complexity, mode 9
+// SOLID48 tuning). value is 0-10 (OPUS_SET_COMPLEXITY) — a GLOBAL override
+// applied to whichever Opus mode is currently streaming (all Opus modes share
+// this one override; MODE_DEFS[mode].complexity is the per-mode default used
+// when unset). Re-ctl's the running encoder immediately, no reboot. -1 clears
+// the override. No-op (logged) on classic (non-CoreS3) senders, which have no
+// Opus encoder. NVS persistence ("tx"/"opus_cplx") is the caller's job
+// (node_serial_config.cpp), mirroring set_input_level/set_input_mix above.
+void audioSourceApplyOpusComplexity(int value);
+int  audioSourceGetOpusComplexity();
+
 // EXPERIMENTAL hardware-debug command (Studio's set_input_sel). Hot-switches
 // the ES8388 ADC input mux between its three addressable pins to investigate
 // a frequency-shelf attenuation defect on the module's line-in L channel —
@@ -52,5 +63,17 @@ void audioSourceSetFleetParam(int param, int value);
 bool audioSourceGetRange();
 int  audioSourceGetLrBitrate();
 const char* audioSourceGetLrPreset();
+
+// HP jitter-buffer depth (Studio's set_stream_hp_buffer, mode-9 SOLID48
+// receiver tuning). `ms` is 40..500 (clamped); persists the raw ms to NVS
+// ("tx"/"hp_buf_ms", owned internally — unlike input_level/mix, this mirrors
+// the self-contained set_range_mode/set_lr_preset style since it must also
+// drive the fleet mechanism) and broadcasts it to the fleet as 0xAC fleet-tune
+// param 6 (wire = clamp(ms/10, 4, 50) deci-ms), reusing the exact same
+// burst x3 + 5s-resend + per-param epoch mechanism as params 1-5
+// (audioSourceSetFleetParam). audioSourceGetStreamHpBuffer returns the raw ms
+// for get_info.
+void audioSourceSetStreamHpBuffer(int ms);
+int  audioSourceGetStreamHpBuffer();
 
 #endif // AUDIO_SOURCE_H

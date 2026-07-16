@@ -11,7 +11,9 @@
 //
 // Supported: get_info (role=transmitter) / set_name / set_espnow_channel /
 // set_input_level / set_input_mix / set_input_sel (EXPERIMENTAL, CoreS3 only) /
-// set_stream_mode / set_relay_source / reboot.
+// set_opus_complexity (mode 9 SOLID48 tuning, DEC-046 follow-up) /
+// set_stream_hp_buffer (mode 9 SOLID48 receiver jitter buffer, AUDIO_SOURCE
+// only — DEC-046 follow-up) / set_stream_mode / set_relay_source / reboot.
 // ---------------------------------------------------------------------------
 
 // Call from loop() BEFORE the binary serial handler. Consumes a JSON config
