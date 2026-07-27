@@ -308,6 +308,23 @@ static const int      I2S_MCLK = 0, I2S_BCLK = 13, I2S_LRCK = 12, I2S_DIN = 34;
 static int     s_input_level = 50;   // 0..100, 50 = unity
 static uint8_t s_channel     = 1;    // ESP-NOW channel (for display)
 
+// Digital gain applied immediately before encoding, separate from the ES8388
+// analog input PGA. It lets the RX analog line-out/PAM gain stay lower.
+static volatile uint8_t s_stream_gain_step = 0;  // 0..8 = 0..+24 dB
+static const uint32_t STREAM_GAIN_Q12[9] = {
+    4096, 5786, 8173, 11550, 16307, 23036, 32538, 45977, 64918
+};
+
+static inline int16_t applyStreamGain(int16_t sample) {
+    uint8_t step = s_stream_gain_step;
+    if (step > 8) step = 8;
+    int32_t scaled = (int32_t)sample * (int32_t)STREAM_GAIN_Q12[step] / 4096;
+    if (scaled > 32767) return 32767;
+    if (scaled < -32768) return -32768;
+    return (int16_t)scaled;
+}
+
+
 // ---- Opus complexity override (opus_complexity, NVS "tx"/"opus_cplx") -----
 // GLOBAL override of OPUS_SET_COMPLEXITY, applied to whichever Opus mode is
 // currently streaming. -1 = unset (each mode's MODE_DEFS[mode].complexity
@@ -962,6 +979,8 @@ static void audioRxTask(void* /*arg*/) {
             if (s_input_mix == INPUT_MIX_MONO_R) L = R;
             else if (s_input_mix == INPUT_MIX_MONO_L) R = L;
             rawStat(L, R);
+            L = applyStreamGain(L);
+            R = applyStreamGain(R);
             // Mode 9 (SOLID48): full 48 kHz stereo direct into Opus, bypassing the
             // FIR decimation entirely. Checked here (before firPush/dcount) since
             // the mode-switch/encoder-config block below only runs at the
@@ -1078,6 +1097,8 @@ void audioSourceSetup() {
         s_input_level = p.getInt("input_level", 50);
         s_input_mix   = p.getUChar("input_mix", INPUT_MIX_STEREO);
         if (s_input_mix > INPUT_MIX_MONO_R) s_input_mix = INPUT_MIX_STEREO;
+        s_stream_gain_step = p.getUChar("stream_gain_step", 0);
+        if (s_stream_gain_step > 8) s_stream_gain_step = 0;
         s_mode        = p.getUChar("mode", MODE_ADPCM);
         if (s_mode >= MODE_COUNT) s_mode = MODE_ADPCM;
         s_range_long  = p.getBool("range_long", false);
@@ -1248,16 +1269,8 @@ static bool    s_uiDirty = true;              // force a full repaint on screen 
 static const uint16_t UI_SEL_BG = 0x0208;     // dark-cyan fill behind a selected item
 static const uint8_t UI_TX_GAIN = 5;
 
-// The ES8388 PGA offers nine 3 dB steps from 0 to +24 dB. These input_level
-// values map one-to-one to its PGA steps. Keeping input_level as the persisted
-// value preserves the Studio serial API while presenting meaningful dB values
-// on the transmitter itself.
-static const uint8_t TX_GAIN_LEVELS[9] = {50, 57, 63, 69, 75, 82, 88, 94, 100};
-
 static int uiGainIndex() {
-    int idx = (s_input_level - 50) * 8 / 50;
-    if (idx < 0) idx = 0;
-    return idx > 8 ? 8 : idx;
+    return s_stream_gain_step > 8 ? 8 : s_stream_gain_step;
 }
 
 
@@ -1383,9 +1396,9 @@ static void uiRepaint() {
     uint8_t m = s_mode < MODE_COUNT ? s_mode : 0;
     if (s_ui == UI_TX_GAIN) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
-        d.setTextDatum(textdatum_t::top_left); d.drawString("< TX INPUT GAIN", 6, 6);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< TX STREAM GAIN", 6, 6);
         d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        d.drawString("quiet source only; avoid INPUT PEAK CLIP", 8, 30);
+        d.drawString("PCM before ESP-NOW; lower RX amp to reduce noise", 8, 30);
         int cur = uiGainIndex();
         for (int i = 0; i < 9; i++) {
             int col = i % 3, row = i / 3;
@@ -1395,7 +1408,7 @@ static void uiRepaint() {
             uint16_t bg = sel ? UI_SEL_BG : TFT_BLACK;
             if (sel) d.fillRoundRect(x, y, 98, 54, 6, UI_SEL_BG);
             d.drawRoundRect(x, y, 98, 54, 6, sel ? TFT_CYAN : TFT_DARKGREY);
-            char lbl[8]; snprintf(lbl, sizeof(lbl), "+%ddB", i * 3);
+            char lbl[8]; snprintf(lbl, sizeof(lbl), "+%udB", (unsigned)(i * 3));
             d.setTextDatum(textdatum_t::middle_center);
             d.setTextSize(2); d.setTextColor(sel ? TFT_WHITE : TFT_LIGHTGREY, bg);
             d.drawString(lbl, x + 49, y + 27);
@@ -1450,8 +1463,8 @@ static void uiRepaint() {
         // compete with MODE/CHANNEL (user 2026-07-11). Bottom-right is free: the
         // meter is top-right, the pkt/s·drop stats are bottom-left.
         uiBtn(232, 206, 82, 30, "RX VOL", TFT_DARKGREY, TFT_DARKCYAN, false);
-        // TX GAIN changes this transmitter's ES8388 input PGA; RX VOL remains
-        // the receiver fleet-wide volume ceiling.
+        // TX GAIN scales PCM before ESP-NOW; RX VOL remains the receiver fleet-
+        // wide volume ceiling.
         uiBtn(210, 122, 104, 22, "TX GAIN", TFT_DARKGREY, TFT_DARKCYAN, false);
     } else if (s_ui == UI_FAMILY) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -1604,7 +1617,7 @@ static void uiTouch(int x, int y) {
         if (cx >= 98 || cy >= 54) return;
         int i = row * 3 + col;
         if (i >= 0 && i < 9) {
-            audioSourceSetInputLevel(TX_GAIN_LEVELS[i]);
+            audioSourceSetStreamGainStep(i);
             s_ui = UI_HOME;
             s_uiDirty = true;
         }
@@ -1845,8 +1858,8 @@ void audioSourceLoop() {
         int32_t r = (accR / DECIMATE) * s_input_level / 50;
         if (l > 32767)  l = 32767;  else if (l < -32768) l = -32768;
         if (r > 32767)  r = 32767;  else if (r < -32768) r = -32768;
-        pcm[o * 2]     = (int16_t)l;
-        pcm[o * 2 + 1] = (int16_t)r;
+        pcm[o * 2]     = applyStreamGain((int16_t)l);
+        pcm[o * 2 + 1] = applyStreamGain((int16_t)r);
     }
 
     streamEncodeAndSend(pcm);
@@ -1867,16 +1880,16 @@ void audioSourceApplyInputLevel(int level) {
 }
 
 // ---------------------------------------------------------------------------
-// Persist one transmitter input level for the CoreS3 TX GAIN touch menu.
-void audioSourceSetInputLevel(int level) {
-    if (level < 0) level = 0;
-    if (level > 100) level = 100;
+// Persist a digital pre-encode gain step for the CoreS3 TX GAIN touch menu.
+void audioSourceSetStreamGainStep(int step) {
+    if (step < 0) step = 0;
+    if (step > 8) step = 8;
     Preferences p;
     p.begin("tx", false);
-    p.putInt("input_level", level);
+    p.putUChar("stream_gain_step", (uint8_t)step);
     p.end();
-    audioSourceApplyInputLevel(level);
-    Serial.printf("[AUDIO-SRC] input_level -> %d\n", level);
+    s_stream_gain_step = (uint8_t)step;
+    Serial.printf("[AUDIO-SRC] stream_gain -> +%d dB\n", step * 3);
 }
 
 // ---------------------------------------------------------------------------
