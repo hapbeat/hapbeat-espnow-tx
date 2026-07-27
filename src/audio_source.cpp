@@ -1246,6 +1246,20 @@ enum { UI_HOME = 0, UI_FAMILY = 1, UI_MODE = 2, UI_CH = 3, UI_VOLMAX = 4 };
 static uint8_t s_ui      = UI_HOME;
 static bool    s_uiDirty = true;              // force a full repaint on screen change
 static const uint16_t UI_SEL_BG = 0x0208;     // dark-cyan fill behind a selected item
+static const uint8_t UI_TX_GAIN = 5;
+
+// The ES8388 PGA offers nine 3 dB steps from 0 to +24 dB. These input_level
+// values map one-to-one to its PGA steps. Keeping input_level as the persisted
+// value preserves the Studio serial API while presenting meaningful dB values
+// on the transmitter itself.
+static const uint8_t TX_GAIN_LEVELS[9] = {50, 57, 63, 69, 75, 82, 88, 94, 100};
+
+static int uiGainIndex() {
+    int idx = (s_input_level - 50) * 8 / 50;
+    if (idx < 0) idx = 0;
+    return idx > 8 ? 8 : idx;
+}
+
 
 static void uiBtn(int x, int y, int w, int h, const char* s, uint16_t bd, uint16_t tx, bool sel) {
     auto& d = M5.Display;
@@ -1367,6 +1381,30 @@ static void uiRepaint() {
     auto& d = M5.Display;
     d.fillScreen(TFT_BLACK);
     uint8_t m = s_mode < MODE_COUNT ? s_mode : 0;
+    if (s_ui == UI_TX_GAIN) {
+        d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
+        d.setTextDatum(textdatum_t::top_left); d.drawString("< TX INPUT GAIN", 6, 6);
+        d.setTextSize(1); d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        d.drawString("quiet source only; avoid INPUT PEAK CLIP", 8, 30);
+        int cur = uiGainIndex();
+        for (int i = 0; i < 9; i++) {
+            int col = i % 3, row = i / 3;
+            int x = 6 + col * 104;
+            int y = 48 + row * 60;
+            bool sel = (i == cur);
+            uint16_t bg = sel ? UI_SEL_BG : TFT_BLACK;
+            if (sel) d.fillRoundRect(x, y, 98, 54, 6, UI_SEL_BG);
+            d.drawRoundRect(x, y, 98, 54, 6, sel ? TFT_CYAN : TFT_DARKGREY);
+            char lbl[8]; snprintf(lbl, sizeof(lbl), "+%ddB", i * 3);
+            d.setTextDatum(textdatum_t::middle_center);
+            d.setTextSize(2); d.setTextColor(sel ? TFT_WHITE : TFT_LIGHTGREY, bg);
+            d.drawString(lbl, x + 49, y + 27);
+        }
+        d.setTextDatum(textdatum_t::top_left);
+        s_uiDirty = false;
+        return;
+    }
+
     if (s_ui == UI_HOME) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left);  d.drawString("HAPBEAT SRC", 6, 6);
@@ -1412,6 +1450,9 @@ static void uiRepaint() {
         // compete with MODE/CHANNEL (user 2026-07-11). Bottom-right is free: the
         // meter is top-right, the pkt/s·drop stats are bottom-left.
         uiBtn(232, 206, 82, 30, "RX VOL", TFT_DARKGREY, TFT_DARKCYAN, false);
+        // TX GAIN changes this transmitter's ES8388 input PGA; RX VOL remains
+        // the receiver fleet-wide volume ceiling.
+        uiBtn(210, 122, 104, 22, "TX GAIN", TFT_DARKGREY, TFT_DARKCYAN, false);
     } else if (s_ui == UI_FAMILY) {
         d.setTextSize(2); d.setTextColor(TFT_CYAN, TFT_BLACK);
         d.setTextDatum(textdatum_t::top_left); d.drawString("< SELECT TYPE", 6, 6);
@@ -1552,10 +1593,28 @@ static void uiUpdateHome() {
 
 // Dispatch one touch-release at (x,y) based on the current screen.
 static void uiTouch(int x, int y) {
+    if (s_ui == UI_TX_GAIN) {
+        if (y < 36) { s_ui = UI_HOME; s_uiDirty = true; return; }
+        if (x < 6 || y < 48) return;
+        int col = (x - 6) / 104;
+        int row = (y - 48) / 60;
+        if (col < 0 || col > 2 || row < 0 || row > 2) return;
+        int cx = x - (6 + col * 104);
+        int cy = y - (48 + row * 60);
+        if (cx >= 98 || cy >= 54) return;
+        int i = row * 3 + col;
+        if (i >= 0 && i < 9) {
+            audioSourceSetInputLevel(TX_GAIN_LEVELS[i]);
+            s_ui = UI_HOME;
+            s_uiDirty = true;
+        }
+        return;
+    }
     if (s_ui == UI_HOME) {
         // Main buttons (y148-196): MODE (x<160) / CHANNEL (else). RANGE is chosen
         // via MODE > SELECT TYPE > LONG RANGE (badge display-only).
         if (y >= 148 && y <= 196) { s_ui = (x < 160) ? UI_FAMILY : UI_CH; s_uiDirty = true; }
+        else if (y >= 120 && y < 148 && x >= 210) { s_ui = UI_TX_GAIN; s_uiDirty = true; }
         // Small RX VOL button, bottom-right corner (below the main button row).
         else if (y >= 200 && x >= 220) { s_ui = UI_VOLMAX; s_uiDirty = true; }
     } else if (s_ui == UI_FAMILY) {
@@ -1805,6 +1864,19 @@ void audioSourceApplyInputLevel(int level) {
 #ifdef BOARD_CORES3
     if (s_codecOk) s_audio.setMicGain(pgaFromLevel(level));
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Persist one transmitter input level for the CoreS3 TX GAIN touch menu.
+void audioSourceSetInputLevel(int level) {
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+    Preferences p;
+    p.begin("tx", false);
+    p.putInt("input_level", level);
+    p.end();
+    audioSourceApplyInputLevel(level);
+    Serial.printf("[AUDIO-SRC] input_level -> %d\n", level);
 }
 
 // ---------------------------------------------------------------------------

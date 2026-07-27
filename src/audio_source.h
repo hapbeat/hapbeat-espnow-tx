@@ -19,6 +19,10 @@ void audioSourceLoop();
 // set_input_level. CoreS3 maps it to the ES8388 analog PGA gain.
 void audioSourceApplyInputLevel(int level);
 
+// Persist and apply a new input level. Used by the CoreS3 TX GAIN touch menu.
+// The stored value remains compatible with Studio's set_input_level command.
+void audioSourceSetInputLevel(int level);
+
 // Apply a new input mono-ize mode live (0=stereo, 1=mono_l, 2=mono_r), e.g.
 // from Studio's set_input_mix. Workaround for the CoreS3 Module-Audio's
 // hardware-defective L line-in channel (frequency-shaped attenuation that no
