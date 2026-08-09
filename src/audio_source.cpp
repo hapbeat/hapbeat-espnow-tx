@@ -401,6 +401,9 @@ static          uint32_t s_txPktSent     = 0;
 static volatile uint64_t s_encUsSum = 0;   // sum of per-frame opus_encode() µs
 static volatile uint32_t s_encUsMax = 0;   // worst per-frame opus_encode() µs
 static volatile uint32_t s_encCnt   = 0;   // frames encoded this heartbeat window
+// Mode-9 delayed-repeat counters (DEC-046 v2) — ring itself is declared with
+// the piggyback history further down; these live here for heartbeatTick.
+static uint32_t s_txRepeatSent = 0, s_txRepeatSkip = 0;
 static QueueHandle_t     s_i2sEvtQ  = nullptr;  // I2S_NUM_0 driver event queue
 static volatile uint32_t s_i2sOvf   = 0;   // cumulative RX_Q_OVF + DMA_ERROR events
 
@@ -535,13 +538,14 @@ static void heartbeatTick() {
     long rmean = s_scnt ? (long)(s_rsum / (int64_t)s_scnt) : 0;
     uint32_t enc_avg = s_encCnt ? (uint32_t)(s_encUsSum / s_encCnt) : 0;
     Serial.printf("[AUDIO-SRC] hb codec=%d pkt=%u capfail=%u drop=%u fail=%u "
-                  "enc=%u/%uus ovf=%u heap=%u/%u inflight=%d "
+                  "enc=%u/%uus ovf=%u heap=%u/%u inflight=%d rpt=%u/%u "
                   "L[%ld..%ld m%ld] R[%ld..%ld m%ld]\n",
                   s_codecOk ? 1 : 0,
                   s_txPktSent, s_capFail, s_txDroppedBusy, (uint32_t)s_txSendFail,
                   enc_avg, (uint32_t)s_encUsMax, (uint32_t)s_i2sOvf,
                   (unsigned)esp_get_free_heap_size(),
                   (unsigned)esp_get_minimum_free_heap_size(), s_inflight,
+                  s_txRepeatSent, s_txRepeatSkip,
                   (long)s_lmin, (long)s_lmax, lmean,
                   (long)s_rmin, (long)s_rmax, rmean);
     s_lmin = 32767; s_lmax = -32768; s_lsum = 0;
@@ -707,6 +711,21 @@ static uint8_t      s_opHistLen[3] = {0, 0, 0};
 static uint8_t      s_opHistSeq[3] = {0, 0, 0};
 static int          s_opHistN      = 0;         // valid history entries (0..3)
 
+// ---- Mode-9 delayed repeat (DEC-046 v2 time diversity) ----------------------
+// Re-broadcast the frame sent RPT_OFFSET packets ago as an independent mode-9
+// packet (pb_count=0 — same wire as a primary; receivers tell them apart by
+// seq). A burst that kills a primary AND its adjacent piggyback copies gets
+// repaired ~100 ms later, inside the RX staging lag (12 frames). Airtime cost
+// ≈ one extra ~90 B packet per frame (+2-3% duty @6 Mbps).
+// Fleet note: receivers must carry the stale-seq handling (device-firmware
+// DEC-046 v2) — older receivers rewind their seq tracker on the repeats.
+static const uint8_t RPT_OFFSET = 10;           // frames (10 ms each)
+static const uint8_t RPT_SLOTS  = 16;           // > RPT_OFFSET + margin
+static uint8_t  s_rptBuf[RPT_SLOTS][OPUS_MAX_LEN];
+static uint8_t  s_rptLen[RPT_SLOTS];
+static uint8_t  s_rptSeq[RPT_SLOTS];
+static bool     s_rptValid[RPT_SLOTS];
+
 // (Re)configure the Opus encoder for `mode` (1-3). Encoder state lives in
 // INTERNAL SRAM (PSRAM wait states would ~2× the encode time — see gate①).
 static void opusEncoderConfig(uint8_t mode) {
@@ -816,6 +835,36 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
             else s_txPktSent++;
         }
     }
+    // Mode-9 delayed repeat (DEC-046 v2): remember this frame, then re-send the
+    // frame from RPT_OFFSET packets ago as its own packet. Primary first, repeat
+    // second — if the in-flight cap is hit, the repeat is the one dropped. Runs
+    // even on a primary busy-drop (the stored copy still covers this frame).
+    if (mode == MODE_SOLID48 && flen > 0 && flen <= (int)OPUS_MAX_LEN) {
+        uint8_t i = s_seq % RPT_SLOTS;
+        s_rptValid[i] = true; s_rptSeq[i] = s_seq;
+        s_rptLen[i] = (uint8_t)flen;
+        memcpy(s_rptBuf[i], frame, (size_t)flen);
+        uint8_t rs = (uint8_t)(s_seq - RPT_OFFSET);
+        uint8_t j  = rs % RPT_SLOTS;
+        if (s_rptValid[j] && s_rptSeq[j] == rs) {
+            if (s_inflight >= STREAM_MAX_INFLIGHT) {
+                s_txRepeatSkip++;
+            } else {
+                uint8_t rp[4 + 1 + OPUS_MAX_LEN]; size_t q = 0;
+                rp[q++] = STREAM_TYPE;
+                rp[q++] = mode;
+                rp[q++] = rs;
+                rp[q++] = 0;                    // no piggyback on a repeat
+                rp[q++] = s_rptLen[j];
+                memcpy(rp + q, s_rptBuf[j], s_rptLen[j]); q += s_rptLen[j];
+                s_inflight++;
+                esp_err_t e = esp_now_send(BROADCAST_MAC, rp, q);
+                if (e != ESP_OK) { s_inflight--; s_txSendFail++; }
+                else { s_txPktSent++; s_txRepeatSent++; }
+            }
+        }
+    }
+
     // Record current frame into history (shift ring of 3) + advance seq — done
     // even on a busy-drop so the NEXT packet's piggyback can still recover this
     // frame. Shift: hist[2] <- hist[1] <- hist[0] <- current.
