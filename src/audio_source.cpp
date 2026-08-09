@@ -341,6 +341,17 @@ static volatile int s_opus_complexity_override = -1;
 // hold a full ms range) — see audioSourceSetStreamHpBuffer below.
 static int s_hp_buffer_ms = 120;
 
+// ---- Mode-9 delayed repeat toggle (stream_repeat, NVS "tx"/"rpt_en") -------
+// OFF (default) = mode 9 sends exactly what it sent before DEC-046 v2 (primary
+// + piggyback only), i.e. the low-latency path. ON = also emit the T-10 delayed
+// repeat below (sendOpusPacket), which receivers auto-detect and answer by
+// arming their 12-frame staging ring — robustness at +120 ms of latency. Not a
+// 0xAC fleet param: the receiver infers it from the repeats themselves, so no
+// beacon is needed. Single writer (serial handler / loop task, via
+// audioSourceApplyStreamRepeat) / single reader (sendOpusPacket on the audio
+// task) — same lock-free reasoning as s_input_mix above.
+static volatile bool s_repeat_enabled = false;
+
 // ---- Input mono-ize (input_mix, NVS "tx"/"input_mix") ----------------------
 // Workaround for a HARDWARE defect in the M5 Module-Audio: the L line-in channel
 // has frequency-shaped attenuation (R/L ~1.5x @100 Hz -> 4-6x @1 kHz+), caused by
@@ -839,7 +850,10 @@ static void sendOpusPacket(const uint8_t* frame, int flen) {
     // frame from RPT_OFFSET packets ago as its own packet. Primary first, repeat
     // second — if the in-flight cap is hit, the repeat is the one dropped. Runs
     // even on a primary busy-drop (the stored copy still covers this frame).
-    if (mode == MODE_SOLID48 && flen > 0 && flen <= (int)OPUS_MAX_LEN) {
+    // Gated by set_stream_repeat (default OFF): with it off, mode 9 keeps the
+    // pre-v2 low-latency behaviour and receivers stay un-armed (no +120 ms).
+    if (mode == MODE_SOLID48 && s_repeat_enabled &&
+        flen > 0 && flen <= (int)OPUS_MAX_LEN) {
         uint8_t i = s_seq % RPT_SLOTS;
         s_rptValid[i] = true; s_rptSeq[i] = s_seq;
         s_rptLen[i] = (uint8_t)flen;
@@ -1167,6 +1181,10 @@ void audioSourceSetup() {
         s_hp_buffer_ms = p.getInt("hp_buf_ms", 120);
         if (s_hp_buffer_ms < 40) s_hp_buffer_ms = 40;
         if (s_hp_buffer_ms > 500) s_hp_buffer_ms = 500;
+        // rpt_en (set_stream_repeat): mode-9 delayed repeat toggle, default OFF
+        // (= pre-v2 low-latency mode 9). NVS write happens in
+        // node_serial_config.cpp (mirrors input_level/opus_cplx above).
+        s_repeat_enabled = p.getBool("rpt_en", false);
         // Restore fleet-tune params (P1.4): a reboot must resume broadcasting the
         // same value at the same epoch, or a peer TX that only saw the pre-reboot
         // epoch would see us as "still at the old value" and could win a stale
@@ -1300,11 +1318,12 @@ void audioSourceSetup() {
 
     Serial.printf("[AUDIO-SRC] ch=%u capture=%u Hz -> stream=%u Hz, "
                   "input_level=%d, input_mix=%s, input_sel=%s, max_inflight=%d, "
-                  "opus_complexity=%d, hp_buffer=%dms\n",
+                  "opus_complexity=%d, hp_buffer=%dms, stream_repeat=%s\n",
                   s_channel, CAPTURE_RATE, STREAM_RATE,
                   s_input_level, INPUT_MIX_NAME[s_input_mix],
                   INPUT_SEL_NAME[s_input_sel], STREAM_MAX_INFLIGHT,
-                  s_opus_complexity_override, s_hp_buffer_ms);
+                  s_opus_complexity_override, s_hp_buffer_ms,
+                  s_repeat_enabled ? "on" : "off");
 }
 
 #ifdef BOARD_CORES3
@@ -1981,6 +2000,21 @@ void audioSourceApplyOpusComplexity(int value) {
 }
 
 int audioSourceGetOpusComplexity() { return s_opus_complexity_override; }
+
+// ---------------------------------------------------------------------------
+// Live mode-9 delayed-repeat toggle (serial set_stream_repeat — DEC-046 v2).
+// ON makes sendOpusPacket emit the extra T-10 repeat packet; receivers detect
+// those repeats and arm their staging ring themselves (+120 ms, no 0xAC
+// param needed). OFF restores the pre-v2 low-latency mode-9 wire exactly.
+// Applied live, no reboot — the next encoded frame already follows the new
+// setting. NVS persistence ("tx"/"rpt_en") is the node_serial_config.cpp
+// caller's job, mirroring set_input_level / set_opus_complexity above.
+void audioSourceApplyStreamRepeat(bool on) {
+    s_repeat_enabled = on;
+    Serial.printf("[AUDIO-SRC] stream_repeat -> %s\n", on ? "on" : "off");
+}
+
+bool audioSourceGetStreamRepeat() { return s_repeat_enabled; }
 
 // ---------------------------------------------------------------------------
 // Live input-pin select (Studio/serial set_input_sel, EXPERIMENTAL — see the

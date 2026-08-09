@@ -40,6 +40,15 @@ void audioSourceApplyInputMix(int mix);
 void audioSourceApplyOpusComplexity(int value);
 int  audioSourceGetOpusComplexity();
 
+// Mode-9 delayed-repeat toggle (Studio/serial set_stream_repeat, DEC-046 v2).
+// ON re-sends each frame once more 10 packets later as an independent mode-9
+// packet; receivers detect the repeats and arm their 12-frame staging ring on
+// their own (+120 ms latency, burst-loss robustness). OFF (default) keeps the
+// pre-v2 low-latency mode-9 wire. Applied live, no reboot. NVS persistence
+// ("tx"/"rpt_en") is the caller's job, mirroring set_opus_complexity above.
+void audioSourceApplyStreamRepeat(bool on);
+bool audioSourceGetStreamRepeat();
+
 // EXPERIMENTAL hardware-debug command (Studio's set_input_sel). Hot-switches
 // the ES8388 ADC input mux between its three addressable pins to investigate
 // a frequency-shelf attenuation defect on the module's line-in L channel —

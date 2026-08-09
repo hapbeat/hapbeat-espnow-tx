@@ -150,6 +150,12 @@ static void handleLine(const char* line) {
         // (like input_level/input_mix above) so get_info is correct even
         // before the AUDIO_SOURCE-only live setter has run this boot.
         r["opus_complexity"] = p.getInt("opus_cplx", -1);
+        // stream_repeat (DEC-046 v2, set_stream_repeat): mode-9 SOLID48
+        // delayed-repeat toggle — see audio_source.cpp s_repeat_enabled
+        // docstring. false = pre-v2 low-latency mode 9. Read straight from
+        // NVS (like opus_complexity above) so get_info is correct even before
+        // the AUDIO_SOURCE-only live setter has run this boot.
+        r["stream_repeat"] = p.getBool("rpt_en", false);
         p.end();
 #ifdef AUDIO_SOURCE
         // LONGRANGE state (DEC-043 P5). Only the live audio source carries it.
@@ -271,6 +277,25 @@ static void handleLine(const char* line) {
         audioSourceApplyOpusComplexity(cplx);   // live: re-ctl's the running encoder
 #endif
         r["status"] = "ok"; r["cmd"] = cmd; r["opus_complexity"] = cplx;
+        sendResp(r);
+        return;
+    }
+
+    // ---- set_stream_repeat -------------------------------------------------
+    // {"cmd":"set_stream_repeat","on":0|1} — mode-9 SOLID48 delayed repeat
+    // (DEC-046 v2 time diversity). ON re-sends each frame once more 10 packets
+    // later as an independent mode-9 packet; receivers detect those repeats and
+    // arm their 12-frame staging ring themselves (+120 ms latency, burst-loss
+    // robustness), so no 0xAC fleet param is involved. OFF (default) keeps the
+    // pre-v2 low-latency mode-9 wire. Persisted; applied live to the running
+    // encoder path, no reboot needed (mirrors set_opus_complexity above).
+    if (strcmp(cmd, "set_stream_repeat") == 0) {
+        bool on = doc["on"] | false;
+        Preferences p; p.begin("tx", false); p.putBool("rpt_en", on); p.end();
+#ifdef AUDIO_SOURCE
+        audioSourceApplyStreamRepeat(on);   // live: next encoded frame follows it
+#endif
+        r["status"] = "ok"; r["cmd"] = cmd; r["stream_repeat"] = on;
         sendResp(r);
         return;
     }
