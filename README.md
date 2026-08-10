@@ -1,56 +1,53 @@
-# hapbeat-transmitter-firmware
+# hapbeat-espnow-tx
 
-## この repo の目的
+M5Stack / ESP32 用の **ESP-NOW オーディオストリーミング送信機・リピータのファームウェア**。
+ライン入力（またはマイク）の音声を ADPCM / Opus でエンコードし、ESP-NOW でブロードキャストする。
+受信側は [hapbeat-espnow-rx](https://github.com/hapbeat/hapbeat-espnow-rx)（Arduino ライブラリ）または Hapbeat 本体。
 
-ホスト側の Bridge（host-bridge）から軽量コマンドを受け取り、ESP-NOW を使って Hapbeat 本体群へ無線送信する **送信機ファームウェア** の repo です。現状の M5Stack / ESP32 系送信機に相当するファームウェアをここで開発します。
+60 台の受信機への同時ストリーミング（実運用実績あり）を、ペアリングなし・アクセスポイントなしで行える。
 
-## Hapbeat 本体ファーム（hapbeat-device-firmware）との違い
+## ハードウェア
 
-| 観点 | 送信機ファーム（本 repo） | 本体ファーム（hapbeat-device-firmware） |
-|------|--------------------------|---------------------------------------|
-| 役割 | Bridge からのコマンドを ESP-NOW で中継送信する | 身につけるデバイスとしてローカル再生・Pack 読み込みを行う |
-| wav / Pack | 扱わない | Pack を読み込み、wav / clip を再生する |
-| UI | 持たない | デバイス上の UI・バッテリー管理などを担う |
-| 位置づけ | ホスト側の最終ホップ（中継専用） | エンドデバイス |
+| 役割 | 対応機材 | env |
+|---|---|---|
+| 送信機 | M5Stack Basic / Core2 + [オーディオモジュール](https://www.switch-science.com/products/10417)（ES8388） | `m5stack_audio_tx` |
+| 送信機 | M5Stack CoreS3 + オーディオモジュール | `m5stack_cores3_audio_tx` |
+| リピータ | M5Stack Basic / Core2（単体） | `m5stack_repeater` |
+| リピータ | Seeed XIAO ESP32-C6（単体・ヘッドレス） | `xiao_c6_repeater` |
 
-送信機ファームは **中継送信に特化** しており、wav / Pack / UI / ローカル再生の機能は一切含みません。
+## 書き込み
 
-## Bridge との関係
+ビルド環境なしで書き込む方法が 2 つある。
 
+1. **Web Flasher** — <https://tools.hapbeat.com/flash/espnow-audio/> を Chrome / Edge で開き、USB を繋いで Install を押す
+2. **Hapbeat Studio** — <https://studio.hapbeat.com/> の「周辺機器」から（Hapbeat デバイスの管理と併用する場合はこちら）
+
+自分でビルドする場合は PlatformIO で:
+
+```bash
+pio run -e m5stack_cores3_audio_tx -t upload
 ```
-[Host Application]
-      |
-  [host-bridge]  ← ホスト側の制御面を担う
-      |
-  [transmitter-firmware（本 repo）]  ← 最終ホップの ESP-NOW 送信を担う
-      |  ESP-NOW
-  [Hapbeat 本体群（device-firmware）]
-```
 
-- **Bridge** がホスト側の制御面（コマンド解釈・スケジューリングなど）を担います
-- **送信機ファーム** が Bridge から受けたコマンドを ESP-NOW パケットに変換し、Hapbeat 本体へ無線送信します
-- Bridge と送信機ファームは内部インターフェースで接続されます（SDK から直接参照されることはありません）
+## 使い方
 
-## Pack / wav を扱わないこと
+1. オーディオモジュールのライン入力に音源（PC のヘッドホン出力など）を接続
+2. 本体の画面でモード（コーデック / レート）とチャンネル（1 / 6 / 11）を選択
+3. 受信側のチャンネルを合わせる — **合っていないと一切届かない**
 
-本 repo は Pack 形式や wav / clip を一切処理しません。これらは Hapbeat 本体ファーム（hapbeat-device-firmware）の責務です。送信機ファームが扱うのは、Bridge から渡される軽量コマンドの中継送信のみです。
+モードの一覧・ワイヤフォーマット・受信側の実装は
+[受信ライブラリ側のドキュメント](https://github.com/hapbeat/hapbeat-espnow-rx/tree/main/docs)に集約している。
 
-## 送信機としての責務
+## 機能の概要
 
-送信機ファームが担う責務は以下のとおりです。
+- **送信**: ES8388 からの 48 kHz 取り込み → ADPCM（低遅延系）/ Opus（低ビットレート系）エンコード → ESP-NOW ブロードキャスト。各パケットに直前フレームの複製（piggyback）を同載し、単発ロスを受信側で補完できる
+- **リピータ**: 受信パケットをそのまま再送して到達範囲を広げる。モードバイトの 1 ビットで中継を 1 ホップに制限するため、台数を増やしてもループしない。設定不要
+- **fleet-tune（0xAC ビーコン）**: 受信機群のバッファ深さ・音量上限などを送信機から一括調整
+- **シリアル設定**: Web Serial（Hapbeat Studio）から各種設定を読み書き
 
-- **Broadcast 送信**: 接続されたすべての Hapbeat 本体へ一斉送信
-- **Group send**: 特定のグループに属するデバイス群への送信
-- **Seq（シーケンス番号）管理**: パケットの順序管理・重複検出のためのシーケンス番号の付与
-- **Retry（再送制御）**: 送信失敗時の基本的な再送処理
-- **Delivery policy**: 送信保証レベルの制御（ベストエフォート / 確認付きなど）
+Hapbeat エコシステム向けの機能（再生コマンドの中継・デバイス管理連携）も同居しているが、
+オーディオストリーミングの利用に必須ではない。
 
-## 現在の状態
+## ライセンス
 
-まだ実装コードはありません。repo の方針整理と設計フェーズです。
-
-## 今後の最初のタスク
-
-1. **host-bridge との内部インターフェース整理** — Bridge から送信機ファームへ渡すコマンド形式・通信手段の定義
-2. **ESP-NOW 送信責務の境界定義** — 送信機ファームがどこまでの責任を持つかの明確化
-3. **seq / retry / group send の方針整理** — シーケンス番号の採番ルール、再送制御の基本方針、グループ送信の仕組みの整理
+MIT License（`LICENSE`）。依存する Opus 実装（[arduino-libopus](https://github.com/pschatzmann/arduino-libopus)）の
+ライセンスは各リポジトリを参照。
