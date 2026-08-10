@@ -19,7 +19,7 @@ M5Stack / ESP32 用の **ESP-NOW オーディオストリーミング送信機�
 
 ビルド環境なしで書き込む方法が 2 つある。
 
-1. **Web Flasher** — <https://tools.hapbeat.com/flash/espnow-audio/> を Chrome / Edge で開き、USB を繋いで Install を押す
+1. **Web Flasher** — <https://devtools.hapbeat.com/tools/espnow-flasher/> を Chrome / Edge で開き、USB を繋いで Install を押す
 2. **Hapbeat Studio** — <https://studio.hapbeat.com/> の「周辺機器」から（Hapbeat デバイスの管理と併用する場合はこちら）
 
 自分でビルドする場合は PlatformIO で:
