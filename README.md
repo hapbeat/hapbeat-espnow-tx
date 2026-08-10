@@ -1,6 +1,6 @@
 # hapbeat-espnow-tx
 
-M5Stack / ESP32 用の **ESP-NOW オーディオストリーミング送信機・リピータのファームウェア**。
+M5Stack / ESP32 用の **ESP-NOW オーディオストリーミング送信機・中継器のファームウェア**。
 ライン入力（またはマイク）の音声を ADPCM / Opus でエンコードし、ESP-NOW でブロードキャストする。
 受信側は [hapbeat-espnow-rx](https://github.com/hapbeat/hapbeat-espnow-rx)（Arduino ライブラリ）または Hapbeat 本体。
 
@@ -12,8 +12,8 @@ M5Stack / ESP32 用の **ESP-NOW オーディオストリーミング送信機�
 |---|---|---|
 | 送信機 | M5Stack Basic / Core2 + [オーディオモジュール](https://www.switch-science.com/products/10417)（ES8388） | `m5stack_audio_tx` |
 | 送信機 | M5Stack CoreS3 + オーディオモジュール | `m5stack_cores3_audio_tx` |
-| リピータ | M5Stack Basic / Core2（単体） | `m5stack_repeater` |
-| リピータ | Seeed XIAO ESP32-C6（単体・ヘッドレス） | `xiao_c6_repeater` |
+| 中継器 | M5Stack Basic / Core2（単体） | `m5stack_repeater` |
+| 中継器 | Seeed XIAO ESP32-C6（単体・ヘッドレス） | `xiao_c6_repeater` |
 
 ## 書き込み
 
@@ -40,7 +40,7 @@ pio run -e m5stack_cores3_audio_tx -t upload
 ## 機能の概要
 
 - **送信**: ES8388 からの 48 kHz 取り込み → ADPCM（低遅延系）/ Opus（低ビットレート系）エンコード → ESP-NOW ブロードキャスト。各パケットに直前フレームの複製（piggyback）を同載し、単発ロスを受信側で補完できる
-- **リピータ**: 受信パケットをそのまま再送して到達範囲を広げる。モードバイトの 1 ビットで中継を 1 ホップに制限するため、台数を増やしてもループしない。設定不要
+- **中継器**: 受信パケットをそのまま再送して到達範囲を広げる。モードバイトの 1 ビットで中継を 1 ホップに制限するため、台数を増やしてもループしない。設定不要
 - **fleet-tune（0xAC ビーコン）**: 受信機群のバッファ深さ・音量上限などを送信機から一括調整
 - **シリアル設定**: Web Serial（Hapbeat Studio）から各種設定を読み書き
 
