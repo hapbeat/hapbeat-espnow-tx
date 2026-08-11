@@ -26,9 +26,6 @@ on:
         description: 'Namespaced tag to release (e.g. tx/m5stack_audio_tx/v0.1.0)'
         required: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   # --------------------------------------------------------------------------
   # Smoke build — master push only.
@@ -45,11 +42,11 @@ jobs:
           - m5stack_audio_tx  # ESP-NOW live audio source (M5Stack Basic)
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Cache PlatformIO
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
@@ -101,11 +98,11 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.name }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Cache PlatformIO
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
@@ -147,7 +144,7 @@ jobs:
       - name: List release files
         run: ls -lh release-artifacts/
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: Transmitter Firmware ${{ steps.tag.outputs.name }}
