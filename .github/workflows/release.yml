@@ -44,7 +44,7 @@ jobs:
           - esp32             # Bridge command relay (M5Stack Basic)
           - m5stack_audio_tx  # ESP-NOW live audio source (M5Stack Basic)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -97,7 +97,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.tag.outputs.name }}
 
@@ -138,7 +138,7 @@ jobs:
             cp "$b/variant.json" "release-artifacts/${E}_variant.json"
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
       - name: Generate manifest.json
